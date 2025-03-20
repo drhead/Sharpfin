@@ -2,9 +2,12 @@ import torch
 import torch.nn.functional as F
 from torchvision.transforms.v2 import Transform
 from . import functional as SFF
+from .cms import apply_srgb
 import math
 from enum import Enum
 from typing import Any, Dict
+import PIL
+from PIL import Image
 
 class ResizeKernel(Enum):
     NEAREST = "nearest"
@@ -79,6 +82,7 @@ class Scale(Transform):
             - This is recommended, as rescaling in a linear color space produces correct results.
             - Only disable if your images are not in the sRGB color space.
     """
+    _transformed_types = (torch.Tensor,)
     def __init__(self, 
         out_res: tuple[int, int] | int,
         device: torch.device | str = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu'),
@@ -169,25 +173,15 @@ class Scale(Transform):
             case SharpenKernel.SHARP_2013:
                 kernel = torch.tensor([-1, 6, -1], dtype=dtype, device=device) / 4
                 self.sharp_2013_kernel = torch.outer(kernel, kernel).view(1, 1, 3, 3).expand(3, -1, -1, -1)
-                self.sharpen_step = self.sharp_2013_filter
+                self.sharpen_step = lambda x: SFF.sharpen_conv2d(x, self.sharp_2013_kernel, 1)
             case SharpenKernel.SHARP_2021:
                 kernel = torch.tensor([-1, 6, -35, 204, -35, 6, -1], dtype=dtype, device=device) / 144
                 self.sharp_2021_kernel = torch.outer(kernel, kernel).view(1, 1, 7, 7).expand(3, -1, -1, -1)
-                self.sharpen_step = self.sharp_2021_filter
+                self.sharpen_step = lambda x: SFF.sharpen_conv2d(x, self.sharp_2021_kernel, 3)
             case None:
                 self.sharpen_step = lambda x: x
             case _:
                 raise ValueError(f"Unknown sharpen kernel {sharpen_kernel}")
-
-    def sharp_2013_filter(self, image: torch.Tensor) -> torch.Tensor:
-        # Composed into a single conv2d operation, kernel is made in the __init__ function
-        image = F.pad(image, (1, 1, 1, 1), mode='replicate')
-        return F.conv2d(image, self.sharp_2013_kernel, groups=image.shape[-3])
-
-    def sharp_2021_filter(self, image: torch.Tensor) -> torch.Tensor:
-        # Composed into a single conv2d operation, kernel is made in the __init__ function
-        image = F.pad(image, (3, 3, 3, 3), mode='replicate')
-        return F.conv2d(image, self.sharp_2021_kernel, groups=image.shape[-3])
 
     def downscale_axis(self, image: torch.Tensor, size: int) -> torch.Tensor:
         k = size / image.shape[-1]
@@ -276,7 +270,7 @@ class Scale(Transform):
         image = self.quantize_function(image)
         return image
 
-    def _transform(self, inpt: Any, params: Dict[str, Any]) -> Any:
+    def _transform(self, inpt: torch.Tensor, params: Dict[str, Any]) -> Any:
         image = inpt
         if image.shape[-1] <= self.out_res[-1] and image.shape[-2] <= self.out_res[-2]:
             return self.upscale(image, self.out_res)
@@ -284,3 +278,18 @@ class Scale(Transform):
             return self.downscale(image, self.out_res)
         else:
             raise ValueError("Mixed axis resizing (e.g. scaling one axis up and the other down) is not supported. File a bug report with your use case if needed.")
+
+
+class ApplyCMS(Transform):
+    """Apply color management to a PIL Image to standardize it to sRGB color space.
+
+    This transform does not support torchscript.
+
+    Converts a PIL Image (H x W x C) to a Tensor of shape (C x H x W).
+    """
+    _transformed_types = (Image.Image,)
+
+    def _transform(self, inpt: Image.Image, params: Dict[str, Any]) -> Image.Image:
+        if not isinstance(inpt, Image.Image):
+            raise TypeError(f"pic should be PIL Image. Got {type(inpt)}")
+        return apply_srgb(inpt)

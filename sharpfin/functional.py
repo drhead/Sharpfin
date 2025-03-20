@@ -1,5 +1,6 @@
 import torch
 import numpy as np
+import torch.nn.functional as F
 
 ### Color management and conversion functions
 def srgb_to_linear(image: torch.Tensor) -> torch.Tensor:
@@ -71,6 +72,10 @@ def magic_kernel_sharp_2021(x: torch.Tensor):
 
 def lanczos(x: torch.Tensor, n: int):
     return torch.where(torch.abs(x) < n, torch.sinc(x) * torch.sinc(x/n), 0)
+
+def sharpen_conv2d(image: torch.Tensor, kernel: torch.Tensor, pad: int) -> torch.Tensor:
+    image = F.pad(image, (pad,pad,pad,pad), mode='replicate')
+    return F.conv2d(image, kernel, groups=image.shape[-3])
 
 ### Dithering and related functions.
 def stochastic_round(

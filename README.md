@@ -24,4 +24,7 @@ Note regarding use of GPU resources: A high-resolution image (6000x6000) would u
 
 PIL has great color management code, but it isn't used automatically. This module is intended to not only apply whatever ICC profile exists for an image (which usually would be done for you before display in a web browser or other application) before we convert it to a tensor and perform other operations, but also to properly handle certain aspects of the image such as transparency and rendering intent that are often overlooked as well.
 
-It is packaged as a transform and should ideally be applied **immediately after loading an image** and **before all other transforms**.
+It is packaged as a transform and should ideally be applied **immediately after loading an image** and **before all other transforms**. It will output a PIL image.
+
+### SFT.AlphaComposite
+`SFT.AlphaComposite` is recommended to go immediately after ApplyCMS, since ApplyCMS will output images with alpha channels if they exist. With this, you have control over what color the alpha channel is composited with. Default is pure white (255, 255, 255). Currently operates on PIL images only.

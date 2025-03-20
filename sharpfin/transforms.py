@@ -5,8 +5,7 @@ from . import functional as SFF
 from .cms import apply_srgb
 import math
 from enum import Enum
-from typing import Any, Dict
-import PIL
+from typing import Any, Dict, Tuple
 from PIL import Image
 
 class ResizeKernel(Enum):
@@ -291,5 +290,22 @@ class ApplyCMS(Transform):
 
     def _transform(self, inpt: Image.Image, params: Dict[str, Any]) -> Image.Image:
         if not isinstance(inpt, Image.Image):
-            raise TypeError(f"pic should be PIL Image. Got {type(inpt)}")
+            raise TypeError(f"inpt should be PIL Image. Got {type(inpt)}")
+
         return apply_srgb(inpt)
+
+class AlphaComposite(Transform):
+    _transformed_types = (Image.Image,)
+    def __init__(
+        self,
+        background: Tuple[int,int,int] = (255, 255, 255)
+    ):
+        super().__init__()
+        self.background = background
+
+    def _transform(self, inpt: Image.Image, params: Dict[str, Any]) -> Image.Image:
+        if not isinstance(inpt, Image.Image):
+            raise TypeError(f"inpt should be PIL Image. Got {type(inpt)}")
+
+        bg = Image.new("RGB", inpt.size, self.background).convert('RGBa')
+        return Image.alpha_composite(bg, inpt)

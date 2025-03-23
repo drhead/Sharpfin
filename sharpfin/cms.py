@@ -43,8 +43,8 @@ class CMSWarning(UserWarning):
         self.path = path
         self.cms_info = cms_info
 
-        self.add_note(f"path: {path}")
-        self.add_note(f"info: {cms_info}")
+        # self.add_note(f"path: {path}")
+        # self.add_note(f"info: {cms_info}")
 
 def _coalesce_intent(intent: Intent | int) -> Intent:
     if isinstance(intent, Intent):
@@ -152,11 +152,11 @@ def apply_srgb(
                 ))
 
         if img.has_transparency_data:
-            if img.mode != "RGBa":
+            if img.mode != "RGBA":
                 try:
-                    img = img.convert("RGBa")
+                    img = img.convert("RGBA")
                 except ValueError:
-                    img = img.convert("RGBA").convert("RGBa")
+                    img = img.convert("RGBa").convert("RGBA")
         elif img.mode != "RGB":
             img = img.convert("RGB")
 

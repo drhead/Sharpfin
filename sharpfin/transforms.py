@@ -112,7 +112,7 @@ class Scale(Transform):
                 case _:
                     raise ValueError(f"Unknown quantization handling type {quantization}")
         else:
-            self.quantize_function = lambda x: x
+            self.quantize_function = lambda x: x.to(dtype=out_dtype)
 
         self.resize_kernel, self.kernel_window = _get_resize_kernel(resize_kernel)
 
@@ -138,7 +138,7 @@ class Scale(Transform):
     @torch.compile(disable=False)
     def downscale(self, image: torch.Tensor, out_res: tuple[int, int]):
         H, W = out_res
-        image = image.to(device=self.device, dtype=self.dtype)
+        image = image.to(dtype=self.dtype)
         if self.do_srgb_conversion:
             image = SFF.srgb_to_linear(image)
 
@@ -156,7 +156,7 @@ class Scale(Transform):
     @torch.compile(disable=False)
     def upscale(self, image: torch.Tensor, out_res: tuple[int, int]):
         H, W = out_res
-        image = image.to(device=self.device, dtype=self.dtype)
+        image = image.to(dtype=self.dtype)
         if self.do_srgb_conversion:
             image = SFF.srgb_to_linear(image)
 
@@ -172,7 +172,7 @@ class Scale(Transform):
         return image
 
     def _transform(self, inpt: torch.Tensor, params: Dict[str, Any]) -> torch.Tensor:
-        image = inpt
+        image = inpt.to(device=self.device)
         if image.shape[-1] <= self.out_res[-1] and image.shape[-2] <= self.out_res[-2]:
             return self.upscale(image, self.out_res)
         elif image.shape[-1] >= self.out_res[-1] and image.shape[-2] >= self.out_res[-2]:
@@ -211,5 +211,38 @@ class AlphaComposite(Transform):
         if not inpt.has_transparency_data:
             return inpt
 
-        bg = Image.new("RGB", inpt.size, self.background).convert('RGBa')
-        return Image.alpha_composite(bg, inpt)
+        bg = Image.new("RGB", inpt.size, self.background).convert('RGBA')
+
+        return Image.alpha_composite(bg, inpt).convert('RGB')
+
+class AspectRatioCrop(Transform):
+    _transformed_types = (Image.Image,)
+    def __init__(
+        self,
+        width: int,
+        height: int,
+    ):
+        super().__init__()
+        self.ref_width = width
+        self.ref_height = height
+        self.aspect_ratio = width / height
+
+    def _transform(self, inpt: Image.Image, params: Dict[str, Any]) -> Image.Image:
+        if not isinstance(inpt, Image.Image):
+            raise TypeError(f"inpt should be PIL Image. Got {type(inpt)}")
+
+        left, top, right, bottom = 0, 0, inpt.width, inpt.height
+        inpt_ar = inpt.width / inpt.height
+
+        if inpt_ar > self.aspect_ratio: # input wider than target, crop sides off
+            result_width = int(round(inpt.height / self.ref_height * self.ref_width))
+            crop_amt = (inpt.width - result_width) // 2
+            left += crop_amt
+            right -= crop_amt
+        elif inpt_ar < self.aspect_ratio: # input taller than target, crop top/bottom off
+            result_height = int(round(inpt.width / self.ref_width * self.ref_height))
+            crop_amt = (inpt.height - result_height) // 2
+            top += crop_amt
+            bottom -= crop_amt
+
+        return inpt.crop((left, top, right, bottom))

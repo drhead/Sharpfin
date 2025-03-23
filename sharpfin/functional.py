@@ -1,6 +1,68 @@
 import torch
 import numpy as np
 import torch.nn.functional as F
+from typing import Callable, Tuple
+from enum import Enum
+import math
+
+class ResizeKernel(Enum):
+    NEAREST = "nearest"
+    BILINEAR = "bilinear"
+    CATMULL_ROM = "catmull-rom"
+    MITCHELL = "mitchell"
+    B_SPLINE = "b-spline"
+    LANCZOS2 = "lanczos2"
+    LANCZOS3 = "lanczos3"
+    MAGIC_KERNEL = "magic_kernel"
+    MAGIC_KERNEL_SHARP_2013 = "magic_kernel_sharp_2013"
+    MAGIC_KERNEL_SHARP_2021 = "magic_kernel_sharp_2021"
+
+class SharpenKernel(Enum):
+    SHARP_2013 = "sharp_2013"
+    SHARP_2021 = "sharp_2021"
+
+class QuantHandling(Enum):
+    TRUNCATE = "truncate"
+    ROUND = "round"
+    STOCHASTIC_ROUND = "stochastic_round"
+    BAYER = "bayer"
+
+def _get_resize_kernel(k: ResizeKernel):
+    match k:
+        case ResizeKernel.NEAREST:
+            resize_kernel = nearest
+            kernel_window = 1
+        case ResizeKernel.BILINEAR:
+            resize_kernel = bilinear
+            kernel_window = 1
+        case ResizeKernel.MITCHELL:
+            resize_kernel = mitchell # B = 1/3, C = 1/3
+            kernel_window = 2
+        case ResizeKernel.CATMULL_ROM:
+            resize_kernel = lambda x: mitchell(x, 0.0, 0.5)
+            kernel_window = 2
+        case ResizeKernel.B_SPLINE:
+            resize_kernel = lambda x: mitchell(x, 1.0, 0.0)
+            kernel_window = 2
+        case ResizeKernel.LANCZOS2:
+            resize_kernel = lambda x: lanczos(x, 2)
+            kernel_window = 2
+        case ResizeKernel.LANCZOS3:
+            resize_kernel = lambda x: lanczos(x, 3)
+            kernel_window = 3
+        case ResizeKernel.MAGIC_KERNEL:
+            resize_kernel = magic_kernel
+            kernel_window = 1
+        case ResizeKernel.MAGIC_KERNEL_SHARP_2013:
+            resize_kernel = magic_kernel_sharp_2013
+            kernel_window = 2
+        case ResizeKernel.MAGIC_KERNEL_SHARP_2021:
+            resize_kernel = magic_kernel_sharp_2021
+            kernel_window = 4
+        case _:
+            raise ValueError(f"Unknown resize kernel {k}")
+    return resize_kernel, kernel_window
+
 
 ### Color management and conversion functions
 def srgb_to_linear(image: torch.Tensor) -> torch.Tensor:
@@ -103,3 +165,127 @@ def generate_bayer_matrix(n):
         [4 * smaller_matrix + 0, 4 * smaller_matrix + 2],
         [4 * smaller_matrix + 3, 4 * smaller_matrix + 1]
     ])
+
+### Scaling transforms
+
+def _downscale_axis(
+        image: torch.Tensor,
+        size: int,
+        kernel_window: int,
+        resize_kernel: Callable[[torch.Tensor], torch.Tensor],
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+    k = size / image.shape[-1]
+    PAD = math.ceil(kernel_window / k)
+
+    # Optimization note: doing torch.arange like this will compile to doing a int64 arange. Float arange
+    # is much slower. So don't try to get clever and "optimize" by adding the +0.5 and *k to this.
+    # Source grid is padded to allow "out of range" sampling from the source image.
+    coords_source = (torch.arange(-PAD, image.shape[-1]+PAD, 1, dtype=torch.float32, device=device) + 0.5) * k
+    coords_dest = (torch.arange(0, size, 1, dtype=torch.float32, device=device) + 0.5)
+
+    # Create a grid of relative distances between each point on this axis.
+    coord_grid = torch.empty((coords_source.shape[0], coords_dest.shape[0]), dtype=dtype, device=device)
+    # Coord grid always constructed in torch.float32 because float16 precision breaks down for this
+    # after 1024.0. This subtraction is the first opportunity we have to safely cast to float16.
+    torch.sub(coords_source.unsqueeze(-1), other=coords_dest, out=coord_grid)
+
+    weights = resize_kernel(coord_grid)
+
+    # Normalizing weights to sum to 1 along axis we are resizing on
+    weights /= weights.sum(dim=0, keepdim=True)
+
+    # Padded dimension is reduced by the matmul here.
+    return F.pad(image, (PAD,PAD,0,0), mode='replicate') @ weights
+
+def _upscale_axis(
+        image: torch.Tensor,
+        size: int,
+        kernel_window: int,
+        resize_kernel: Callable[[torch.Tensor], torch.Tensor],
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+    k = size / image.shape[-1]
+    PAD = math.ceil(kernel_window * k)
+
+    # For upsizing, we expect out of range sampling from the destination image.
+    coords_source = (torch.arange(0, image.shape[-1], 1, dtype=torch.float32, device=device) + 0.5)
+    coords_dest = (torch.arange(-PAD, size+PAD, 1, dtype=torch.float32, device=device) + 0.5) / k
+
+    coord_grid = torch.empty((coords_source.shape[0], coords_dest.shape[0]), dtype=dtype, device=device)
+    torch.sub(coords_source.unsqueeze(-1), other=coords_dest, out=coord_grid)
+
+    weights = resize_kernel(coord_grid)
+
+    # We need to explicitly trim padding by summing it into the real area of the destination grid.
+    weights[:, PAD] += weights[:, :PAD].sum(dim=1)
+    weights[:, -PAD-1] += weights[:, -PAD:].sum(dim=1)
+    weights = weights[:, PAD:-PAD]
+
+    weights /= weights.sum(dim=0, keepdim=True)
+
+    return image @ weights
+
+@torch.compile(disable=False)
+def _downscale(
+        image: torch.Tensor,
+        out_res: tuple[int, int],
+        kernel:  Callable[[torch.Tensor], torch.Tensor],
+        window: int,
+        device: torch.device,
+        dtype: torch.dtype,
+        do_srgb_conversion: bool,
+    ):
+    H, W = out_res
+    image = image.to(device=device, dtype=dtype)
+    if do_srgb_conversion:
+        image = srgb_to_linear(image)
+
+    image = _downscale_axis(image, W, window, kernel, device, dtype)
+    image = _downscale_axis(image.mT, H, window, kernel, device, dtype).mT
+
+    if do_srgb_conversion:
+        image = linear_to_srgb(image)
+    image = image.clamp(0,1)
+    return image
+
+@torch.compile(disable=False)
+def _upscale(
+        image: torch.Tensor,
+        out_res: tuple[int, int],
+        kernel:  Callable[[torch.Tensor], torch.Tensor],
+        window: int,
+        device: torch.device,
+        dtype: torch.dtype,
+        do_srgb_conversion: bool,
+    ):
+    H, W = out_res
+    image = image.to(device=device, dtype=dtype)
+    if do_srgb_conversion:
+        image = srgb_to_linear(image)
+
+    image = _upscale_axis(image, W, window, kernel, device, dtype)
+    image = _upscale_axis(image.mT, H, window, kernel, device, dtype).mT
+
+    if do_srgb_conversion:
+        image = linear_to_srgb(image)
+    image = image.clamp(0,1)
+    return image
+
+def scale(
+        image: torch.Tensor,
+        out_res: Tuple[int, int],
+        resize_kernel: ResizeKernel = ResizeKernel.MAGIC_KERNEL_SHARP_2021,
+        device: torch.device = torch.device('cpu'),
+        dtype: torch.dtype = torch.float32,
+        do_srgb_conversion: bool = True,
+        ) -> torch.Tensor:
+    kernel, window = _get_resize_kernel(resize_kernel)
+    if image.shape[-1] <= out_res[-1] and image.shape[-2] <= out_res[-2]:
+        return _upscale(image, out_res, kernel, window, device, dtype, do_srgb_conversion)
+    elif image.shape[-1] >= out_res[-1] and image.shape[-2] >= out_res[-2]:
+        return _downscale(image, out_res, kernel, window, device, dtype, do_srgb_conversion)
+    else:
+        raise ValueError("Mixed axis resizing (e.g. scaling one axis up and the other down) is not supported. File a bug report with your use case if needed.")

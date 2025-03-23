@@ -4,31 +4,11 @@ from torchvision.transforms.v2 import Transform
 from . import functional as SFF
 from .cms import apply_srgb
 import math
-from enum import Enum
 from typing import Any, Dict, Tuple
 from PIL import Image
+from .functional import ResizeKernel, SharpenKernel, QuantHandling, _get_resize_kernel
 
-class ResizeKernel(Enum):
-    NEAREST = "nearest"
-    BILINEAR = "bilinear"
-    CATMULL_ROM = "catmull-rom"
-    MITCHELL = "mitchell"
-    B_SPLINE = "b-spline"
-    LANCZOS2 = "lanczos2"
-    LANCZOS3 = "lanczos3"
-    MAGIC_KERNEL = "magic_kernel"
-    MAGIC_KERNEL_SHARP_2013 = "magic_kernel_sharp_2013"
-    MAGIC_KERNEL_SHARP_2021 = "magic_kernel_sharp_2021"
-
-class SharpenKernel(Enum):
-    SHARP_2013 = "sharp_2013"
-    SHARP_2021 = "sharp_2021"
-
-class QuantHandling(Enum):
-    TRUNCATE = "truncate"
-    ROUND = "round"
-    STOCHASTIC_ROUND = "stochastic_round"
-    BAYER = "bayer"
+__all__ = ["ResizeKernel", "SharpenKernel", "QuantHandling"]
 
 class Scale(Transform):
     """Rescaling transform that supports multiple scaling algorithms and provides appropriate options for output data types.
@@ -36,7 +16,7 @@ class Scale(Transform):
     The input should be a `torch.Tensor` of shape `[B, C, H, W]` or a `TVTensor`. Images are assumed to be in the sRGB color space.
 
     Args:
-        out_res (tuple[int, int], int): Output resolution of the transform. Single int input will be used as resolution for both axes.
+        out_res (tuple[int, int], int): Output resolution of the transform. [H, W]. Single int input will be used as resolution for both axes.
         device (torch.device): The device to perform computations on. Defaults to CUDA if available, otherwise CPU.
         dtype (torch.dtype): The data type for computations.
             - `torch.float16` has plenty enough accuracy and is fast, and is recommended for CUDA backends.
@@ -84,7 +64,7 @@ class Scale(Transform):
     _transformed_types = (torch.Tensor,)
     def __init__(self, 
         out_res: tuple[int, int] | int,
-        device: torch.device | str = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu'),
+        device: torch.device | str = torch.device('cpu'),
         dtype: torch.dtype = torch.float32,
         out_dtype: torch.dtype | None = None,
         quantization: QuantHandling = QuantHandling.ROUND,
@@ -134,39 +114,7 @@ class Scale(Transform):
         else:
             self.quantize_function = lambda x: x
 
-        match resize_kernel:
-            case ResizeKernel.NEAREST:
-                self.resize_kernel = SFF.nearest
-                self.kernel_window = 1
-            case ResizeKernel.BILINEAR:
-                self.resize_kernel = SFF.bilinear
-                self.kernel_window = 1
-            case ResizeKernel.MITCHELL:
-                self.resize_kernel = SFF.mitchell # B = 1/3, C = 1/3
-                self.kernel_window = 2
-            case ResizeKernel.CATMULL_ROM:
-                self.resize_kernel = lambda x: SFF.mitchell(x, 0.0, 0.5)
-                self.kernel_window = 2
-            case ResizeKernel.B_SPLINE:
-                self.resize_kernel = lambda x: SFF.mitchell(x, 1.0, 0.0)
-                self.kernel_window = 2
-            case ResizeKernel.LANCZOS2:
-                self.resize_kernel = lambda x: SFF.lanczos(x, 2)
-                self.kernel_window = 2
-            case ResizeKernel.LANCZOS3:
-                self.resize_kernel = lambda x: SFF.lanczos(x, 3)
-                self.kernel_window = 3
-            case ResizeKernel.MAGIC_KERNEL:
-                self.resize_kernel = SFF.magic_kernel
-                self.kernel_window = 1
-            case ResizeKernel.MAGIC_KERNEL_SHARP_2013:
-                self.resize_kernel = SFF.magic_kernel_sharp_2013
-                self.kernel_window = 2
-            case ResizeKernel.MAGIC_KERNEL_SHARP_2021:
-                self.resize_kernel = SFF.magic_kernel_sharp_2021
-                self.kernel_window = 4
-            case _:
-                raise ValueError(f"Unknown resize kernel {resize_kernel}")
+        self.resize_kernel, self.kernel_window = _get_resize_kernel(resize_kernel)
 
         match sharpen_kernel:
             case SharpenKernel.SHARP_2013:
@@ -182,52 +130,6 @@ class Scale(Transform):
             case _:
                 raise ValueError(f"Unknown sharpen kernel {sharpen_kernel}")
 
-    def downscale_axis(self, image: torch.Tensor, size: int) -> torch.Tensor:
-        k = size / image.shape[-1]
-        PAD = math.ceil(self.kernel_window / k)
-
-        # Optimization note: doing torch.arange like this will compile to doing a int64 arange. Float arange
-        # is much slower. So don't try to get clever and "optimize" by adding the +0.5 and *k to this.
-        # Source grid is padded to allow "out of range" sampling from the source image.
-        coords_source = (torch.arange(-PAD, image.shape[-1]+PAD, 1, dtype=torch.float32, device=self.device) + 0.5) * k
-        coords_dest = (torch.arange(0, size, 1, dtype=torch.float32, device=self.device) + 0.5)
-
-        # Create a grid of relative distances between each point on this axis.
-        coord_grid = torch.empty((coords_source.shape[0], coords_dest.shape[0]), dtype=self.dtype, device=self.device)
-        # Coord grid always constructed in torch.float32 because float16 precision breaks down for this
-        # after 1024.0. This subtraction is the first opportunity we have to safely cast to float16.
-        torch.sub(coords_source.unsqueeze(-1), other=coords_dest, out=coord_grid)
-
-        weights = self.resize_kernel(coord_grid)
-
-        # Normalizing weights to sum to 1 along axis we are resizing on
-        weights /= weights.sum(dim=0, keepdim=True)
-
-        # Padded dimension is reduced by the matmul here.
-        return F.pad(image, (PAD,PAD,0,0), mode='replicate') @ weights
-
-    def upscale_axis(self, image: torch.Tensor, size: int) -> torch.Tensor:
-        k = size / image.shape[-1]
-        PAD = math.ceil(self.kernel_window * k)
-
-        # For upsizing, we expect out of range sampling from the destination image.
-        coords_source = (torch.arange(0, image.shape[-1], 1, dtype=torch.float32, device=self.device) + 0.5)
-        coords_dest = (torch.arange(-PAD, size+PAD, 1, dtype=torch.float32, device=self.device) + 0.5) / k
-
-        coord_grid = torch.empty((coords_source.shape[0], coords_dest.shape[0]), dtype=self.dtype, device=self.device)
-        torch.sub(coords_source.unsqueeze(-1), other=coords_dest, out=coord_grid)
-
-        weights = self.resize_kernel(coord_grid)
-
-        # We need to explicitly trim padding by summing it into the real area of the destination grid.
-        weights[:, PAD] += weights[:, :PAD].sum(dim=1)
-        weights[:, -PAD-1] += weights[:, -PAD:].sum(dim=1)
-        weights = weights[:, PAD:-PAD]
-
-        weights /= weights.sum(dim=0, keepdim=True)
-
-        return image @ weights
-
     def apply_bayer_matrix(self, x: torch.Tensor):
         H, W = x.shape[-2:]
         b = self.bayer_matrix.repeat(1,1,math.ceil(H/16),math.ceil(W/16))[:,:,:H,:W]
@@ -240,8 +142,8 @@ class Scale(Transform):
         if self.do_srgb_conversion:
             image = SFF.srgb_to_linear(image)
 
-        image = self.downscale_axis(image, W)
-        image = self.downscale_axis(image.mT, H).mT
+        image = SFF._downscale_axis(image, W, self.kernel_window, self.resize_kernel, self.device, self.dtype)
+        image = SFF._downscale_axis(image.mT, H, self.kernel_window, self.resize_kernel, self.device, self.dtype).mT
 
         image = self.sharpen_step(image)
 
@@ -260,8 +162,8 @@ class Scale(Transform):
 
         image = self.sharpen_step(image)
 
-        image = self.upscale_axis(image, W)
-        image = self.upscale_axis(image.mT, H).mT
+        image = SFF._upscale_axis(image, W, self.kernel_window, self.resize_kernel, self.device, self.dtype)
+        image = SFF._upscale_axis(image.mT, H, self.kernel_window, self.resize_kernel, self.device, self.dtype).mT
 
         if self.do_srgb_conversion:
             image = SFF.linear_to_srgb(image)
@@ -269,7 +171,7 @@ class Scale(Transform):
         image = self.quantize_function(image)
         return image
 
-    def _transform(self, inpt: torch.Tensor, params: Dict[str, Any]) -> Any:
+    def _transform(self, inpt: torch.Tensor, params: Dict[str, Any]) -> torch.Tensor:
         image = inpt
         if image.shape[-1] <= self.out_res[-1] and image.shape[-2] <= self.out_res[-2]:
             return self.upscale(image, self.out_res)
@@ -306,6 +208,8 @@ class AlphaComposite(Transform):
     def _transform(self, inpt: Image.Image, params: Dict[str, Any]) -> Image.Image:
         if not isinstance(inpt, Image.Image):
             raise TypeError(f"inpt should be PIL Image. Got {type(inpt)}")
+        if not inpt.has_transparency_data:
+            return inpt
 
         bg = Image.new("RGB", inpt.size, self.background).convert('RGBa')
         return Image.alpha_composite(bg, inpt)

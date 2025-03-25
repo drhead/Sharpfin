@@ -125,7 +125,6 @@ def magic_kernel_sharp_2021(x: torch.Tensor):
 
     weights = torch.where(x <= 4.5, (-1/288) * (x - 9/2) ** 2, 0)
     weights = torch.where(x <= 3.5, (1/36) * (x - 3) * (x - 15/4), weights)
-    weights = torch.where(x <= 3.5, (1/36) * (x - 3) * (x - 15/4), weights)
     weights = torch.where(x <= 2.5, (1/6) * (x - 2) * (65/24 - x), weights)
     weights = torch.where(x <= 1.5, (35/36) * (x - 1) * (x - 239/140), weights)
     weights = torch.where(x <= 0.5, (577/576) - (239/144) * x ** 2, weights)

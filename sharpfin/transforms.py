@@ -7,6 +7,9 @@ import math
 from typing import Any, Dict, Tuple
 from PIL import Image
 from .functional import ResizeKernel, SharpenKernel, QuantHandling, _get_resize_kernel
+from contextlib import nullcontext
+# from Pytorch >= 2.6
+set_stance = getattr(torch.compiler, "set_stance", None)
 
 __all__ = ["ResizeKernel", "SharpenKernel", "QuantHandling"]
 
@@ -173,13 +176,16 @@ class Scale(Transform):
 
     def _transform(self, inpt: torch.Tensor, params: Dict[str, Any]) -> torch.Tensor:
         image = inpt.to(device=self.device)
-        if image.shape[-1] <= self.out_res[-1] and image.shape[-2] <= self.out_res[-2]:
-            return self.upscale(image, self.out_res)
-        elif image.shape[-1] >= self.out_res[-1] and image.shape[-2] >= self.out_res[-2]:
-            return self.downscale(image, self.out_res)
-        else:
-            raise ValueError("Mixed axis resizing (e.g. scaling one axis up and the other down) is not supported. File a bug report with your use case if needed.")
-
+        context_manager = (
+            set_stance("force_eager") if set_stance and self.device.type == "cpu" else nullcontext()
+        )
+        with context_manager:
+            if image.shape[-1] <= self.out_res[-1] and image.shape[-2] <= self.out_res[-2]:
+                return self.upscale(image, self.out_res)
+            elif image.shape[-1] >= self.out_res[-1] and image.shape[-2] >= self.out_res[-2]:
+                return self.downscale(image, self.out_res)
+            else:
+                raise ValueError("Mixed axis resizing (e.g. scaling one axis up and the other down) is not supported. File a bug report with your use case if needed.")
 
 class ApplyCMS(Transform):
     """Apply color management to a PIL Image to standardize it to sRGB color space.

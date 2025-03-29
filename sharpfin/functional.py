@@ -4,6 +4,10 @@ import torch.nn.functional as F
 from typing import Callable, Tuple
 from enum import Enum
 import math
+from contextlib import nullcontext
+# from Pytorch >= 2.6
+set_stance = getattr(torch.compiler, "set_stance", None)
+
 
 class ResizeKernel(Enum):
     NEAREST = "nearest"
@@ -52,13 +56,13 @@ def _get_resize_kernel(k: ResizeKernel):
             kernel_window = 3
         case ResizeKernel.MAGIC_KERNEL:
             resize_kernel = magic_kernel
-            kernel_window = 1
+            kernel_window = 1.5
         case ResizeKernel.MAGIC_KERNEL_SHARP_2013:
             resize_kernel = magic_kernel_sharp_2013
-            kernel_window = 2
+            kernel_window = 2.5
         case ResizeKernel.MAGIC_KERNEL_SHARP_2021:
             resize_kernel = magic_kernel_sharp_2021
-            kernel_window = 4
+            kernel_window = 4.5
         case _:
             raise ValueError(f"Unknown resize kernel {k}")
     return resize_kernel, kernel_window
@@ -281,10 +285,14 @@ def scale(
         dtype: torch.dtype = torch.float32,
         do_srgb_conversion: bool = True,
         ) -> torch.Tensor:
+    context_manager = (
+        set_stance("force_eager") if set_stance and device.type == "cpu" else nullcontext()
+    )
     kernel, window = _get_resize_kernel(resize_kernel)
-    if image.shape[-1] <= out_res[-1] and image.shape[-2] <= out_res[-2]:
-        return _upscale(image, out_res, kernel, window, device, dtype, do_srgb_conversion)
-    elif image.shape[-1] >= out_res[-1] and image.shape[-2] >= out_res[-2]:
-        return _downscale(image, out_res, kernel, window, device, dtype, do_srgb_conversion)
-    else:
-        raise ValueError("Mixed axis resizing (e.g. scaling one axis up and the other down) is not supported. File a bug report with your use case if needed.")
+    with context_manager:
+        if image.shape[-1] <= out_res[-1] and image.shape[-2] <= out_res[-2]:
+            return _upscale(image, out_res, kernel, window, device, dtype, do_srgb_conversion)
+        elif image.shape[-1] >= out_res[-1] and image.shape[-2] >= out_res[-2]:
+            return _downscale(image, out_res, kernel, window, device, dtype, do_srgb_conversion)
+        else:
+            raise ValueError("Mixed axis resizing (e.g. scaling one axis up and the other down) is not supported. File a bug report with your use case if needed.")

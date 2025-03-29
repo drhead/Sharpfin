@@ -139,30 +139,29 @@ def apply_srgb(
                         ))
                 else:
                     warn(CMSWarning(
-                        "unsupported intent, assuming sRGB",
+                        f"unsupported intent on {path} assuming sRGB: {cms_info}",
                         path=path,
                         cms_info=cms_info
                     ))
             except PyCMSError as ex:
                 warn(CMSWarning(
-                    f"{ex}, assuming sRGB",
+                    f"{ex} on {path}, assuming sRGB: {cms_info}",
                     path=path,
                     cms_info=cms_info,
                     cause=ex,
                 ))
 
-        if img.has_transparency_data:
-            if img.mode != "RGBA":
-                try:
-                    img = img.convert("RGBA")
-                except ValueError:
-                    img = img.convert("RGBa").convert("RGBA")
-        elif img.mode != "RGB":
-            img = img.convert("RGB")
+    except Exception as e:
+        print(f"{ex} on {path}, assuming sRGB: {cms_info}",)
 
-    except:
-        img.close()
-        raise
+    if img.has_transparency_data:
+        if img.mode != "RGBA":
+            try:
+                img = img.convert("RGBA")
+            except ValueError:
+                img = img.convert("RGBa").convert("RGBA")
+    elif img.mode != "RGB":
+        img = img.convert("RGB")
 
     return img
 

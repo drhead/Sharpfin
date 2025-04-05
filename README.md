@@ -31,7 +31,7 @@ It is packaged as a transform and should ideally be applied **immediately after 
 `SFT.AlphaComposite` is recommended to go immediately after ApplyCMS, since ApplyCMS will output images with alpha channels if they exist. With this, you have control over what color the alpha channel is composited with. Default is pure white (255, 255, 255). Currently operates on PIL images only.
 
 ### SFT.AspectRatioCrop
-`SFT.AspectRatioCrop` is intended to crop an image minimally to be the same aspect ratio as the provided resolution. If you don't use this before using `SFT.Scale`, it is very likely that your image will be distorted.
+`SFT.AspectRatioCrop` is intended to crop an image minimally to be the same aspect ratio as the provided resolution. If you don't use this before using `SFT.Scale`, it is very likely that your image will be distorted. (TODO: make this part of `SFT.Scale`, and leave the cropped area for use in place of edge padding where possible)
 
 ## Dataloader module: `import sharpfin.dataloader as SDL`
 

@@ -3,6 +3,7 @@ Library of custom Torchvision transforms built for accuracy, visual quality, and
 
 This library is being developed to address some common and often overlooked challenges in image data handling within the machine learning space, with a focus on making it easy to handle image data properly. It is currently in very early development (so early that I am not even guaranteeing anything in this repo works at all at this point), and implementations and even default settings may change frequently and without warning.
 
+## Transforms library: `import sharpfin.transforms as SFT`
 
 ### SFT.Scale
 For understanding why this module is necessary and helpful, let us first review what the most widely used options for image resize in the ML space are:
@@ -28,3 +29,28 @@ It is packaged as a transform and should ideally be applied **immediately after 
 
 ### SFT.AlphaComposite
 `SFT.AlphaComposite` is recommended to go immediately after ApplyCMS, since ApplyCMS will output images with alpha channels if they exist. With this, you have control over what color the alpha channel is composited with. Default is pure white (255, 255, 255). Currently operates on PIL images only.
+
+### SFT.AspectRatioCrop
+`SFT.AspectRatioCrop` is intended to crop an image minimally to be the same aspect ratio as the provided resolution. If you don't use this before using `SFT.Scale`, it is very likely that your image will be distorted.
+
+## Dataloader module: `import sharpfin.dataloader as SDL`
+
+Sharpfin's dataloader module is in early development. The goal for it is to provide better preset dataloaders for common workloads, with a flexible and fast dataset specification.
+
+### Dataset specification
+
+Our dataset specification uses `msgspec`, because it is quite fast at loading data compared to virtually every other option. Msgspec typically uses Structs to deserialize data into. Our part of what is specified is barebones. For example, this is what an image dataset item looks like (skipping some internal bits):
+
+```py
+# Generic type variable for conditioning
+T = TypeVar("T", bound=msgspec.Struct)
+
+class ImageDatasetItem(msgspec.Struct, Generic[T]):
+    image_path: str
+    height: Optional[int] = None
+    width: Optional[int] = None
+
+    conditioning: Optional[T] = None
+```
+
+This doesn't seem like much. But you don't actually need to know more than this. You need to know where the image is, and ideally want to know *reliable* information about its dimensions (so that you can do things like aspect ratio bucketing done by `SDL.BucketedDataset`, which needs to be done in advance, without having to read every image first). The `conditioning` attribute is something that *you* will provide. You define your own `msgspec.Struct` with the conditioning information *your* model needs. We also provide an input for you to define your own function to do any necessary processing of your conditioning information, which will then be passed through and (hopefully) collated as part of the batch. Or, you can also just not use this. Go make a VAE, or an unconditional GAN for old times' sake. In any case, you can do that more easily with less code.

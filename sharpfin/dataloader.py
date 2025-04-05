@@ -15,7 +15,7 @@ from tqdm.auto import tqdm
 
 Bucket = namedtuple('Bucket', ['height', 'width'])
 
-# Define a generic type variable for conditioning
+# Generic type variable for conditioning
 T = TypeVar("T", bound=msgspec.Struct)
 
 class ImageDatasetItem(msgspec.Struct, Generic[T]):

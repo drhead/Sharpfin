@@ -20,7 +20,7 @@ class Scale(Transform):
 
     Args:
         out_res (tuple[int, int], int): Output resolution of the transform. [H, W]. Single int input will be used as resolution for both axes.
-        device (torch.device): The device to perform computations on. Defaults to CUDA if available, otherwise CPU.
+        device (torch.device): The device to perform computations on. Defaults to CPU.
         dtype (torch.dtype): The data type for computations.
             - `torch.float16` has plenty enough accuracy and is fast, and is recommended for CUDA backends.
             - `torch.float32` has more than enough accuracy, and is recommended for CPU backends (because most CPUs do not have FPUs that handle float16)

@@ -3,6 +3,7 @@ import torch
 import triton
 import triton.language as tl
 from dataclasses import dataclass
+from .triton_functional import linear_to_srgb_triton
 
 # Code is all adapted from https://github.com/stanford-futuredata/stk, licensed under Apache-2.0
 # Very reduced set of functions for handling DDS (Dense = Dense @ Sparse) matmul only, with the
@@ -388,7 +389,7 @@ def _dds_kernel(A, B, C, M, N, K,
             stride_bk, stride_bn,
             stride_cm, stride_cn,
             row_indices, column_indices, offsets,
-            block_offsets_t, trans_A: tl.constexpr, trans_B: tl.constexpr,
+            block_offsets_t, trans_A: tl.constexpr, trans_B: tl.constexpr, fuse_srgb: tl.constexpr,
             BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
             BLOCK_SIZE: tl.constexpr, GROUP_M: tl.constexpr, ACC_TYPE: tl.constexpr,
             ):
@@ -411,7 +412,6 @@ def _dds_kernel(A, B, C, M, N, K,
     rak = tl.arange(0, BLOCK_K)
 
     mask_rm = (rm < M)[:, None]
-
 
     A += (rm[:, None] * stride_am + rak[None, :] * stride_ak)
 
@@ -450,6 +450,8 @@ def _dds_kernel(A, B, C, M, N, K,
         acc = tl.dot(a, b, acc)
 
     acc = acc.to(C.dtype.element_ty)
+    if fuse_srgb:
+        acc = linear_to_srgb_triton(acc)
     cm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     cn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
 
@@ -468,6 +470,7 @@ def triton_dds(lhs: torch.Tensor,
         column_indices_t: torch.Tensor,
         block_offsets_t: torch.Tensor,
         transpose_b: bool,
+        fuse_srgb: bool,
         out: torch.Tensor
     ):
 
@@ -484,8 +487,6 @@ def triton_dds(lhs: torch.Tensor,
 
     # accumulator types
     ACC_TYPE = tl.float32 if lhs.dtype in [torch.float16, torch.bfloat16, torch.float32] else tl.int32
-
-
 
     if trans_A:
         stride_am, stride_ak = lhs.stride(1), lhs.stride(0)
@@ -508,13 +509,13 @@ def triton_dds(lhs: torch.Tensor,
         stride_bk, stride_bn,
         out.stride(0), out.stride(1),
         row_indices, b_column_indices, b_offsets,
-        block_offsets_t, trans_A, trans_B,
+        block_offsets_t, trans_A, trans_B, fuse_srgb,
         GROUP_M=128, ACC_TYPE=ACC_TYPE,
         BLOCK_N=data.shape[1], BLOCK_SIZE=data.shape[1], BLOCK_K=min(data.shape[1], 32)
     )
     return out
 
-def dds(a, b):
+def dds(a, b, fuse_srgb = False):
     assert isinstance(a, torch.Tensor)
     assert isinstance(b, Matrix)
     out = torch.empty((a.size()[0], b.size()[1]),
@@ -530,5 +531,6 @@ def dds(a, b):
         b.column_indices_t,
         b.block_offsets_t,
         not b.is_contiguous(),
+        fuse_srgb,
         out
         )

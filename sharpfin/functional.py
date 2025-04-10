@@ -5,6 +5,7 @@ from typing import Callable, Tuple
 from enum import Enum
 import math
 from contextlib import nullcontext
+from .triton_functional import _downscale_sparse
 # from Pytorch >= 2.6
 set_stance = getattr(torch.compiler, "set_stance", None)
 
@@ -35,25 +36,25 @@ def _get_resize_kernel(k: ResizeKernel):
     match k:
         case ResizeKernel.NEAREST:
             resize_kernel = nearest
-            kernel_window = 1
+            kernel_window = 0.5
         case ResizeKernel.BILINEAR:
             resize_kernel = bilinear
-            kernel_window = 1
+            kernel_window = 1.
         case ResizeKernel.MITCHELL:
             resize_kernel = mitchell # B = 1/3, C = 1/3
-            kernel_window = 2
+            kernel_window = 2.
         case ResizeKernel.CATMULL_ROM:
             resize_kernel = lambda x: mitchell(x, 0.0, 0.5)
-            kernel_window = 2
+            kernel_window = 2.
         case ResizeKernel.B_SPLINE:
             resize_kernel = lambda x: mitchell(x, 1.0, 0.0)
-            kernel_window = 2
+            kernel_window = 2.
         case ResizeKernel.LANCZOS2:
             resize_kernel = lambda x: lanczos(x, 2)
-            kernel_window = 2
+            kernel_window = 2.
         case ResizeKernel.LANCZOS3:
             resize_kernel = lambda x: lanczos(x, 3)
-            kernel_window = 3
+            kernel_window = 3.
         case ResizeKernel.MAGIC_KERNEL:
             resize_kernel = magic_kernel
             kernel_window = 1.5
@@ -174,13 +175,13 @@ def generate_bayer_matrix(n):
 def _downscale_axis(
         image: torch.Tensor,
         size: int,
-        kernel_window: int,
-        resize_kernel: Callable[[torch.Tensor], torch.Tensor],
+        resize_kernel: ResizeKernel,
         device: torch.device,
         dtype: torch.dtype,
     ) -> torch.Tensor:
+    kernel, window = _get_resize_kernel(resize_kernel)
     k = size / image.shape[-1]
-    PAD = math.ceil(kernel_window / k)
+    PAD = math.ceil((window - 0.5) / k)
 
     # Optimization note: doing torch.arange like this will compile to doing a int64 arange. Float arange
     # is much slower. So don't try to get clever and "optimize" by adding the +0.5 and *k to this.
@@ -194,10 +195,11 @@ def _downscale_axis(
     # after 1024.0. This subtraction is the first opportunity we have to safely cast to float16.
     torch.sub(coords_source.unsqueeze(-1), other=coords_dest, out=coord_grid)
 
-    weights = resize_kernel(coord_grid)
+    weights = kernel(coord_grid)
 
     # Normalizing weights to sum to 1 along axis we are resizing on
     weights /= weights.sum(dim=0, keepdim=True)
+    # weights /= (1/k)
 
     # Padded dimension is reduced by the matmul here.
     return F.pad(image, (PAD,PAD,0,0), mode='replicate') @ weights
@@ -205,13 +207,13 @@ def _downscale_axis(
 def _upscale_axis(
         image: torch.Tensor,
         size: int,
-        kernel_window: int,
-        resize_kernel: Callable[[torch.Tensor], torch.Tensor],
+        resize_kernel: ResizeKernel,
         device: torch.device,
         dtype: torch.dtype,
     ) -> torch.Tensor:
+    kernel, window = _get_resize_kernel(resize_kernel)
     k = size / image.shape[-1]
-    PAD = math.ceil(kernel_window * k)
+    PAD = math.ceil((window - 0.5) * k)
 
     # For upsizing, we expect out of range sampling from the destination image.
     coords_source = (torch.arange(0, image.shape[-1], 1, dtype=torch.float32, device=device) + 0.5)
@@ -220,7 +222,7 @@ def _upscale_axis(
     coord_grid = torch.empty((coords_source.shape[0], coords_dest.shape[0]), dtype=dtype, device=device)
     torch.sub(coords_source.unsqueeze(-1), other=coords_dest, out=coord_grid)
 
-    weights = resize_kernel(coord_grid)
+    weights = kernel(coord_grid)
 
     # We need to explicitly trim padding by summing it into the real area of the destination grid.
     weights[:, PAD] += weights[:, :PAD].sum(dim=1)
@@ -235,8 +237,7 @@ def _upscale_axis(
 def _downscale(
         image: torch.Tensor,
         out_res: tuple[int, int],
-        kernel:  Callable[[torch.Tensor], torch.Tensor],
-        window: int,
+        resize_kernel: ResizeKernel,
         device: torch.device,
         dtype: torch.dtype,
         do_srgb_conversion: bool,
@@ -246,8 +247,8 @@ def _downscale(
     if do_srgb_conversion:
         image = srgb_to_linear(image)
 
-    image = _downscale_axis(image, W, window, kernel, device, dtype)
-    image = _downscale_axis(image.mT, H, window, kernel, device, dtype).mT
+    image = _downscale_axis(image, W, resize_kernel, device, dtype)
+    image = _downscale_axis(image.mT, H, resize_kernel, device, dtype).mT
 
     if do_srgb_conversion:
         image = linear_to_srgb(image)
@@ -258,8 +259,7 @@ def _downscale(
 def _upscale(
         image: torch.Tensor,
         out_res: tuple[int, int],
-        kernel:  Callable[[torch.Tensor], torch.Tensor],
-        window: int,
+        resize_kernel:  ResizeKernel,
         device: torch.device,
         dtype: torch.dtype,
         do_srgb_conversion: bool,
@@ -269,8 +269,8 @@ def _upscale(
     if do_srgb_conversion:
         image = srgb_to_linear(image)
 
-    image = _upscale_axis(image, W, window, kernel, device, dtype)
-    image = _upscale_axis(image.mT, H, window, kernel, device, dtype).mT
+    image = _upscale_axis(image, W, resize_kernel, device, dtype)
+    image = _upscale_axis(image.mT, H, resize_kernel, device, dtype).mT
 
     if do_srgb_conversion:
         image = linear_to_srgb(image)
@@ -284,15 +284,25 @@ def scale(
         device: torch.device = torch.device('cpu'),
         dtype: torch.dtype = torch.float32,
         do_srgb_conversion: bool = True,
-        ) -> torch.Tensor:
+        use_sparse: bool = False,
+    ) -> torch.Tensor:
+    if isinstance(device, str):
+        device = torch.device(device)
+    if use_sparse:
+        assert device.type != "cpu", "sparse implementation is only for GPU!"
+        if resize_kernel != ResizeKernel.MAGIC_KERNEL_SHARP_2021:
+            raise NotImplementedError
+
     context_manager = (
         set_stance("force_eager") if set_stance and device.type == "cpu" else nullcontext()
     )
-    kernel, window = _get_resize_kernel(resize_kernel)
     with context_manager:
         if image.shape[-1] <= out_res[-1] and image.shape[-2] <= out_res[-2]:
-            return _upscale(image, out_res, kernel, window, device, dtype, do_srgb_conversion)
+            assert not use_sparse
+            return _upscale(image, out_res, resize_kernel, device, dtype, do_srgb_conversion)
         elif image.shape[-1] >= out_res[-1] and image.shape[-2] >= out_res[-2]:
-            return _downscale(image, out_res, kernel, window, device, dtype, do_srgb_conversion)
+            if use_sparse:
+                return _downscale_sparse(image, out_res, resize_kernel)
+            return _downscale(image, out_res, resize_kernel, device, dtype, do_srgb_conversion)
         else:
             raise ValueError("Mixed axis resizing (e.g. scaling one axis up and the other down) is not supported. File a bug report with your use case if needed.")

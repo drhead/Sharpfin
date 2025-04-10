@@ -20,6 +20,9 @@ For understanding why this module is necessary and helpful, let us first review 
 
 Note regarding use of GPU resources: A high-resolution image (6000x6000) would use about 200MB of memory in a 16 bit float format. The peak memory usage for `SFT.Scale` is a bit over twice the memory usage of the source image itself. You should account for this if using it in CUDA mode during a training run, for instance -- in many cases it is better and more than adequate to simply run resizing on the CPU unless your model is particularly high-throughput. CUDA can be much better for bulk preprocessing of images in advance of a training run.
 
+#### **NEW** (4/10/2025): Sparsity Support
+A custom Triton implementation of the resizing engine has now been added, making use of sparsity to avoid a sizeable portion of the matmul operation. Sparsity code is adapted from stanford-futuredata/stk with changes mainly oriented at allowing more flexibility for input shapes. From my testing, performance now seems to match F.interpolate on bicubic with antialiasing.
+
 ### SFT.ApplyCMS
 `SFT.ApplyCMS` is intended to make proper color management of images as effortless as possible. Original implementation is largely made by @redhottensors.
 

@@ -1,12 +1,15 @@
 import torch
 import torch.nn.functional as F
 from torchvision.transforms.v2 import Transform
+
+import sharpfin.util
+from .util import QuantHandling, ResizeKernel, SharpenKernel
 from . import functional as SFF
 from .cms import apply_srgb
 import math
 from typing import Any, Dict, Tuple
 from PIL import Image
-from .functional import ResizeKernel, SharpenKernel, QuantHandling, _get_resize_kernel
+from .functional import _get_resize_kernel
 from .triton_functional import _downscale_sparse
 from contextlib import nullcontext
 # from Pytorch >= 2.6
@@ -151,7 +154,7 @@ class Scale(Transform):
         H, W = out_res
         image = image.to(dtype=self.dtype)
         if self.do_srgb_conversion:
-            image = SFF.srgb_to_linear(image)
+            image = sharpfin.util.srgb_to_linear(image)
 
         image = SFF._downscale_axis(image, W, self.kernel_window, self.resize_kernel, self.device, self.dtype)
         image = SFF._downscale_axis(image.mT, H, self.kernel_window, self.resize_kernel, self.device, self.dtype).mT
@@ -159,7 +162,7 @@ class Scale(Transform):
         image = self.sharpen_step(image)
 
         if self.do_srgb_conversion:
-            image = SFF.linear_to_srgb(image)
+            image = sharpfin.util.linear_to_srgb(image)
         image = image.clamp(0,1)
         image = self.quantize_function(image)
         return image
@@ -176,7 +179,7 @@ class Scale(Transform):
         H, W = out_res
         image = image.to(dtype=self.dtype)
         if self.do_srgb_conversion:
-            image = SFF.srgb_to_linear(image)
+            image = sharpfin.util.srgb_to_linear(image)
 
         image = self.sharpen_step(image)
 
@@ -184,7 +187,7 @@ class Scale(Transform):
         image = SFF._upscale_axis(image.mT, H, self.kernel_window, self.resize_kernel, self.device, self.dtype).mT
 
         if self.do_srgb_conversion:
-            image = SFF.linear_to_srgb(image)
+            image = sharpfin.util.linear_to_srgb(image)
         image = image.clamp(0,1)
         image = self.quantize_function(image)
         return image

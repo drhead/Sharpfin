@@ -2,35 +2,14 @@ import torch
 import numpy as np
 import torch.nn.functional as F
 from typing import Callable, Tuple
-from enum import Enum
 import math
 from contextlib import nullcontext
-from .triton_functional import _downscale_sparse
+
+from sharpfin.util import ResizeKernel, linear_to_srgb, srgb_to_linear
+
 # from Pytorch >= 2.6
 set_stance = getattr(torch.compiler, "set_stance", None)
 
-
-class ResizeKernel(Enum):
-    NEAREST = "nearest"
-    BILINEAR = "bilinear"
-    CATMULL_ROM = "catmull-rom"
-    MITCHELL = "mitchell"
-    B_SPLINE = "b-spline"
-    LANCZOS2 = "lanczos2"
-    LANCZOS3 = "lanczos3"
-    MAGIC_KERNEL = "magic_kernel"
-    MAGIC_KERNEL_SHARP_2013 = "magic_kernel_sharp_2013"
-    MAGIC_KERNEL_SHARP_2021 = "magic_kernel_sharp_2021"
-
-class SharpenKernel(Enum):
-    SHARP_2013 = "sharp_2013"
-    SHARP_2021 = "sharp_2021"
-
-class QuantHandling(Enum):
-    TRUNCATE = "truncate"
-    ROUND = "round"
-    STOCHASTIC_ROUND = "stochastic_round"
-    BAYER = "bayer"
 
 def _get_resize_kernel(k: ResizeKernel):
     match k:
@@ -68,22 +47,6 @@ def _get_resize_kernel(k: ResizeKernel):
             raise ValueError(f"Unknown resize kernel {k}")
     return resize_kernel, kernel_window
 
-
-### Color management and conversion functions
-def srgb_to_linear(image: torch.Tensor) -> torch.Tensor:
-    return torch.where(
-        image <= 0.04045,
-        image / 12.92,
-        # Clamping is for protection against NaNs during backwards passes.
-        ((torch.clamp(image, min=0.04045) + 0.055) / 1.055) ** 2.4
-    )
-
-def linear_to_srgb(image: torch.Tensor) -> torch.Tensor:
-    return torch.where(
-        image <= 0.0031308,
-        image * 12.92,
-        torch.clamp(1.055 * image ** (1 / 2.4) - 0.055, min=0.0, max=1.0)
-    )
 
 ### Resampling kernels
 def nearest(x: torch.Tensor) -> torch.Tensor:
@@ -276,6 +239,8 @@ def _upscale(
         image = linear_to_srgb(image)
     image = image.clamp(0,1)
     return image
+
+from .triton_functional import _downscale_sparse
 
 def scale(
         image: torch.Tensor,

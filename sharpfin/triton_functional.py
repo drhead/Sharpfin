@@ -3,9 +3,11 @@ import math
 import triton
 import triton.language as tl
 
-from sharpfin.functional import ResizeKernel, srgb_to_linear, linear_to_srgb
+from sharpfin.util import ResizeKernel
 from typing import Tuple
 import torch.nn.functional as F
+
+from sharpfin.util import linear_to_srgb, srgb_to_linear
 
 
 # Magic Kernel Sharp modified to operate in-place on negative values
@@ -280,11 +282,13 @@ def _downscale_sparse(
         image: torch.Tensor,
         target_size: Tuple[int, int],
         resize_kernel: ResizeKernel = ResizeKernel.MAGIC_KERNEL_SHARP_2021,
+        BLOCK_SIZE: int = 32,
+        SPARSE_BLOCK_SIZE: int = 64
     ) -> torch.Tensor:
     kernel, window = _get_resize_kernel_triton(resize_kernel)
 
-    y_s_w = compute_sparse_coord_grid(target_size[-1], image.shape[-1], window)
-    y_s_h = compute_sparse_coord_grid(target_size[-2], image.shape[-2], window)
+    y_s_w = compute_sparse_coord_grid(target_size[-1], image.shape[-1], window, BLOCK_SIZE, SPARSE_BLOCK_SIZE)
+    y_s_h = compute_sparse_coord_grid(target_size[-2], image.shape[-2], window, BLOCK_SIZE, SPARSE_BLOCK_SIZE)
 
     PAD_W = math.ceil((window - 0.5) / (target_size[-1] / image.shape[-1]))
     PAD_H = math.ceil((window - 0.5) / (target_size[-2] / image.shape[-2]))

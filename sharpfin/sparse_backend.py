@@ -369,17 +369,14 @@ class TritonConfig:
     BLOCK_M: int = 128
     BLOCK_N: int = 128
     BLOCK_K: int = 32
-    BLOCK_SIZE: int = 128
+    BLOCK_SIZE: int = 64
     NUM_STAGES: int = 4
     NUM_WARPS: int = 4
 
 @triton.autotune(
     configs=[
         # basic configs for compute-bound matmuls
-        triton.Config({
-            'BLOCK_M': TritonConfig.BLOCK_M,
-            # 'BLOCK_K': TritonConfig.BLOCK_K,
-        }, num_stages=TritonConfig.NUM_STAGES, num_warps=TritonConfig.NUM_WARPS),
+        triton.Config({}, num_stages=TritonConfig.NUM_STAGES, num_warps=TritonConfig.NUM_WARPS),
     ],
     key=['M', 'N', 'K'],
 )
@@ -407,13 +404,12 @@ def _dds_kernel(A, B, C, M, N, K,
 
     BLOCK_ELEMENTS = BLOCK_SIZE * BLOCK_SIZE
 
-    # pointers to dense matrix
-    rm =  pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    rak = tl.arange(0, BLOCK_K)
-
-    mask_rm = (rm < M)[:, None]
-
-    A += (rm[:, None] * stride_am + rak[None, :] * stride_ak)
+    # block pointer to dense matrix improves L1 cache efficiency
+    A_block_ptr = tl.make_block_ptr(
+        base=A, shape=(M, K), strides=(stride_am, stride_ak),
+        offsets=(pid_m * BLOCK_M, 0), block_shape=(BLOCK_M, BLOCK_K),
+        order=(0, 1)
+    )
 
     # pointers to sparse matrix
     rn = tl.arange(0, BLOCK_N)
@@ -429,25 +425,23 @@ def _dds_kernel(A, B, C, M, N, K,
     ak_block_incr = BLOCK_SIZE * stride_ak
     bk_sub_incr = BLOCK_K * stride_bk
 
-    for k in range(nsub_blocks * (end_inx - start_inx)):
-        sub_block_inx = k % nsub_blocks
-        block_inx = k // nsub_blocks
+    for block_inx in range(end_inx - start_inx):
+        a_col_idx = tl.load(column_indices + start_inx + block_inx)
+        A_ptr = tl.advance(A_block_ptr, (0, a_col_idx * ak_block_incr))
 
         if trans_B:
-            ptr_B = B + (start_inx + block_inx) * BLOCK_ELEMENTS + sub_block_inx * bk_sub_incr
+            b_block_offset = (start_inx + block_inx)
         else:
-            ptr_B = B + tl.load(block_offsets_t + start_inx + block_inx) * BLOCK_ELEMENTS + sub_block_inx * bk_sub_incr
+            b_block_offset = tl.load(block_offsets_t + start_inx + block_inx)
 
-        a_col_idx = tl.load(column_indices + start_inx + block_inx)
-        ptr_A = A + a_col_idx * ak_block_incr + sub_block_inx * ak_sub_incr
+        for sub_block_inx in range(nsub_blocks):
+            ptr_B = B + b_block_offset * BLOCK_ELEMENTS + sub_block_inx * bk_sub_incr
 
-        rak_mask = a_col_idx * BLOCK_SIZE + sub_block_inx * BLOCK_K + rak
+            a = tl.load(A_ptr)
+            b = tl.load(ptr_B)
+            acc = tl.dot(a, b, acc, out_dtype=tl.float16)
 
-        mask_A = mask_rm & (rak_mask < K)[None, :]
-
-        a = tl.load(ptr_A, mask=mask_A, other=0.0)
-        b = tl.load(ptr_B)
-        acc = tl.dot(a, b, acc)
+            A_ptr = tl.advance(A_ptr, (0, ak_sub_incr))
 
     acc = acc.to(C.dtype.element_ty)
     if fuse_srgb:
@@ -483,11 +477,6 @@ def triton_dds(lhs: torch.Tensor,
     M, K = lhs.shape
     _, N = shape
 
-    # _validate_matmul_dims(M, K, N)
-
-    # accumulator types
-    ACC_TYPE = tl.float32 if lhs.dtype in [torch.float16, torch.bfloat16, torch.float32] else tl.int32
-
     if trans_A:
         stride_am, stride_ak = lhs.stride(1), lhs.stride(0)
     else:
@@ -510,7 +499,7 @@ def triton_dds(lhs: torch.Tensor,
         out.stride(0), out.stride(1),
         row_indices, b_column_indices, b_offsets,
         block_offsets_t, trans_A, trans_B, fuse_srgb,
-        GROUP_M=128, ACC_TYPE=ACC_TYPE,
+        GROUP_M=128, ACC_TYPE=tl.float16, BLOCK_M=64,
         BLOCK_N=data.shape[1], BLOCK_SIZE=data.shape[1], BLOCK_K=min(data.shape[1], 32)
     )
     return out

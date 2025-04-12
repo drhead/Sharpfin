@@ -10,7 +10,7 @@ import math
 from typing import Any, Dict, Tuple
 from PIL import Image
 from .functional import _get_resize_kernel
-from .triton_functional import _downscale_sparse
+from .triton_functional import downscale_sparse
 from contextlib import nullcontext
 # from Pytorch >= 2.6
 set_stance = getattr(torch.compiler, "set_stance", None)
@@ -170,7 +170,7 @@ class Scale(Transform):
     @torch.compile(disable=False)
     def downscale_sparse(self, image: torch.Tensor, out_res: tuple[int, int]):
         image = image.to(dtype=self.dtype)
-        image = _downscale_sparse(image, out_res)
+        image = downscale_sparse(image, out_res)
         image = self.quantize_function(image)
         return image
 

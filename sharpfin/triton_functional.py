@@ -117,8 +117,10 @@ def create_tensor_metadata(
     row_indices = indices[:,0] # type: torch.Tensor
     col_indices = indices[:,1] # type: torch.Tensor
 
+    # Strangely, being unstable is better for kernel performance.
+    # Stable will cause warp stalls.
     torch.argsort(col_indices, stable=False, out=block_offsets_t)
-    torch.gather(row_indices, 0, block_offsets_t, out=col_indices_t)
+    torch.take(row_indices, block_offsets_t, out=col_indices_t)
 
     # reusing the offsets buffer here helps performance
     torch.sum(tile_mask, dim=1, out=offsets[1:])
@@ -127,7 +129,21 @@ def create_tensor_metadata(
     torch.cumsum(offsets_t, dim=0, out=offsets_t)
     return row_indices, col_indices, block_offsets_t, col_indices_t, offsets, offsets_t
 
+# for isolating the one mandatory graph break
 @torch.compiler.disable
+def _get_nnz_and_buffers(tile_mask):
+    num_sparse_blocks = torch.sum(tile_mask).item()
+    return (
+        num_sparse_blocks,
+        [
+            torch.empty((2, num_sparse_blocks), dtype=torch.int64, pin_memory=True).T, # indices
+            torch.empty((num_sparse_blocks,), dtype=torch.int64, pin_memory=True), #block_offsets_t
+            torch.empty((num_sparse_blocks,), dtype=torch.int64, pin_memory=True), #col_indices_t
+            torch.zeros((tile_mask.shape[0] + 1,), dtype=torch.int32, pin_memory=True), #offsets
+            torch.zeros((tile_mask.shape[1] + 1,), dtype=torch.int32, pin_memory=True) #offsets_t
+        ]
+    )
+
 def generate_sparse_matrix(dest_size, src_size, kernel_window=4.5, tile_size=64):
     """
     Generate a sparse resampling matrix based on a block-wise mask.
@@ -145,7 +161,8 @@ def generate_sparse_matrix(dest_size, src_size, kernel_window=4.5, tile_size=64)
     tile_mask = create_tile_mask(dest_size, src_size, kernel_window, tile_size)
 
     # Needs to be item since used to create tensor shapes. Unavoidable.
-    num_sparse_blocks = torch.sum(tile_mask).item()
+    # Inductor also does not support pinned memory, need to create buffers outside of compile.
+    num_sparse_blocks, buffers = _get_nnz_and_buffers(tile_mask)
 
     # Pinned memory buffers created here will be the in the same memory locations ultimately used.
     # The transpose on the indices matrix is done so that row_indices and col_indices are contiguous
@@ -153,23 +170,19 @@ def generate_sparse_matrix(dest_size, src_size, kernel_window=4.5, tile_size=64)
     row_indices, col_indices, block_offsets_t, col_indices_t, offsets, offsets_t = create_tensor_metadata(
         num_sparse_blocks,
         tile_mask,
-        torch.empty((2, num_sparse_blocks), dtype=torch.int64, pin_memory=True).T, # indices
-        torch.empty((num_sparse_blocks,), dtype=torch.int64, pin_memory=True), #block_offsets_t
-        torch.empty((num_sparse_blocks,), dtype=torch.int64, pin_memory=True), #col_indices_t
-        torch.zeros((tile_mask.shape[0] + 1,), dtype=torch.int32, pin_memory=True), #offsets
-        torch.zeros((tile_mask.shape[1] + 1,), dtype=torch.int32, pin_memory=True) #offsets_t
+        *buffers
     )
 
     # Create sparse tensor
     return Matrix(
         (tile_mask.shape[0] * tile_size, tile_mask.shape[1] * tile_size),
         torch.empty(num_sparse_blocks, tile_size, tile_size, dtype=torch.float16, device='cuda'),
-        row_indices.to(device='cuda', non_blocking=True),
-        col_indices.to(device='cuda', non_blocking=True),
-        offsets.to(device='cuda', non_blocking=True),
-        column_indices_t=col_indices_t.to(device='cuda', non_blocking=True),
-        offsets_t=offsets_t.to(device='cuda', non_blocking=True),
-        block_offsets_t=block_offsets_t.to(device='cuda', non_blocking=True)
+        row_indices.to(device='cuda', dtype=torch.int32, non_blocking=True),
+        col_indices.to(device='cuda', dtype=torch.int32, non_blocking=True),
+        offsets.to(device='cuda', dtype=torch.int32, non_blocking=True),
+        column_indices_t=col_indices_t.to(device='cuda', dtype=torch.int32, non_blocking=True),
+        offsets_t=offsets_t.to(device='cuda', dtype=torch.int32, non_blocking=True),
+        block_offsets_t=block_offsets_t.to(device='cuda', dtype=torch.int32, non_blocking=True)
     )
 
 @triton.jit
@@ -278,7 +291,7 @@ def compute_coord_grid(target_size, source_size, kernel_window=4.5, BLOCK_SIZE=3
     return coord_grid
 
 @torch.compile
-def _downscale_sparse(
+def downscale_sparse(
         image: torch.Tensor,
         target_size: Tuple[int, int],
         resize_kernel: ResizeKernel = ResizeKernel.MAGIC_KERNEL_SHARP_2021,
@@ -315,7 +328,7 @@ def _downscale_sparse(
     return image
 
 @torch.compile
-def _downscale_triton(
+def downscale_triton(
         image: torch.Tensor,
         target_size: Tuple[int, int],
         resize_kernel: ResizeKernel = ResizeKernel.MAGIC_KERNEL_SHARP_2021,

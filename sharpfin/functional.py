@@ -240,7 +240,7 @@ def _upscale(
     image = image.clamp(0,1)
     return image
 
-from .triton_functional import _downscale_sparse
+from .triton_functional import downscale_sparse
 
 def scale(
         image: torch.Tensor,
@@ -267,7 +267,7 @@ def scale(
             return _upscale(image, out_res, resize_kernel, device, dtype, do_srgb_conversion)
         elif image.shape[-1] >= out_res[-1] and image.shape[-2] >= out_res[-2]:
             if use_sparse:
-                return _downscale_sparse(image, out_res, resize_kernel)
+                return downscale_sparse(image, out_res, resize_kernel)
             return _downscale(image, out_res, resize_kernel, device, dtype, do_srgb_conversion)
         else:
             raise ValueError("Mixed axis resizing (e.g. scaling one axis up and the other down) is not supported. File a bug report with your use case if needed.")

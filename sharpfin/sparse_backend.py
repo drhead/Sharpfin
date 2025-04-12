@@ -454,22 +454,22 @@ def _dds_kernel(A, B, C, M, N, K,
 
     tl.store(C, acc, mask=mask_C)
 
-def triton_dds(lhs: torch.Tensor,
+def triton_dds(
+        lhs: torch.Tensor,
+        rhs: Matrix,
         shape,
-        data: torch.Tensor,
-        offsets: torch.Tensor,
-        row_indices: torch.Tensor,
-        column_indices: torch.Tensor,
-        offsets_t: torch.Tensor,
-        column_indices_t: torch.Tensor,
-        block_offsets_t: torch.Tensor,
-        transpose_b: bool,
-        fuse_srgb: bool,
-        out: torch.Tensor
+        fuse_srgb: bool = False,
     ):
+    assert isinstance(lhs, torch.Tensor)
+    assert isinstance(rhs, Matrix)
 
-    device = lhs.device
-    trans_B = transpose_b
+    out = torch.empty(
+        (lhs.size()[0], shape[1]),
+        dtype=lhs.dtype,
+        device=lhs.device
+    )
+
+    trans_B = not rhs.is_contiguous()
     trans_A = (lhs.stride(0) > 1 and lhs.stride(1) > 1)
 
     # checks constraints
@@ -483,43 +483,23 @@ def triton_dds(lhs: torch.Tensor,
         stride_am, stride_ak = lhs.stride(0), lhs.stride(1)
 
     if trans_B:
-        stride_bk, stride_bn = data.stride(2), data.stride(1)
-        b_column_indices, b_offsets = column_indices, offsets
+        stride_bk, stride_bn = rhs.data.stride(2), rhs.data.stride(1)
+        b_column_indices, b_offsets = rhs.column_indices, rhs.offsets
     else:
-        stride_bk, stride_bn = data.stride(1), data.stride(2)
-        b_column_indices, b_offsets = column_indices_t, offsets_t
+        stride_bk, stride_bn = rhs.data.stride(1), rhs.data.stride(2)
+        b_column_indices, b_offsets = rhs.column_indices_t, rhs.offsets_t
 
     # launch kernel
     grid = lambda META: (triton.cdiv(M, META['BLOCK_M']), triton.cdiv(N, META['BLOCK_N']))
 
     _dds_kernel[grid](
-        lhs, data, out, M, N, K,
+        lhs, rhs.data, out, M, N, K,
         stride_am, stride_ak,
         stride_bk, stride_bn,
         out.stride(0), out.stride(1),
-        row_indices, b_column_indices, b_offsets,
-        block_offsets_t, trans_A, trans_B, fuse_srgb,
+        rhs.row_indices, b_column_indices, b_offsets,
+        rhs.block_offsets_t, trans_A, trans_B, fuse_srgb,
         GROUP_M=128, ACC_TYPE=tl.float16, BLOCK_M=64,
-        BLOCK_N=data.shape[1], BLOCK_SIZE=data.shape[1], BLOCK_K=min(data.shape[1], 32)
+        BLOCK_N=rhs.data.shape[1], BLOCK_SIZE=rhs.data.shape[1], BLOCK_K=min(rhs.data.shape[1], 32)
     )
     return out
-
-def dds(a, b, fuse_srgb = False):
-    assert isinstance(a, torch.Tensor)
-    assert isinstance(b, Matrix)
-    out = torch.empty((a.size()[0], b.size()[1]),
-                    dtype=a.dtype,
-                    device=a.device)
-    return triton_dds(
-        a,
-        b.size(),
-        b.data, b.offsets,
-        b.row_indices,
-        b.column_indices,
-        b.offsets_t,
-        b.column_indices_t,
-        b.block_offsets_t,
-        not b.is_contiguous(),
-        fuse_srgb,
-        out
-        )

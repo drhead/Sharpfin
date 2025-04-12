@@ -172,3 +172,11 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+
+# tensorboard profile logs
+tb_log/
+
+# nsight profiles
+*.ncu-rep
+*.nsys-rep
+*.sqlite

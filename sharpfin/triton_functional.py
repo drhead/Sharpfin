@@ -6,8 +6,9 @@ import triton.language as tl
 from sharpfin.util import ResizeKernel
 from typing import Tuple
 import torch.nn.functional as F
-
+from triton.language.extra import libdevice
 from sharpfin.util import linear_to_srgb, srgb_to_linear
+
 
 
 # Magic Kernel Sharp modified to operate in-place on negative values
@@ -26,16 +27,16 @@ def magic_kernel_sharp_2021_triton(x):
 @triton.jit
 def linear_to_srgb_triton(x):
     return tl.where(x <= 0.0031308, 
-                    x * 12.92, 
-                    1.055 * tl.math.exp(tl.math.log(tl.cast(x, tl.float32)) / 2.4) - 0.055)
+                    x * 12.92,
+                    1.055 * libdevice.pow(x, 1/2.4) - 0.055)
 
 @triton.jit
 def srgb_to_linear_triton(x):
     return tl.where(x <= 0.04045, 
-                    x / 12.92, 
-                    tl.math.exp(tl.math.log(tl.cast((x + 0.055) / 1.055, tl.float32)) * 2.4))
+                    x / 12.92,
+                    libdevice.pow((x + 0.055) / 1.055, 2.4))
 
-from sharpfin.sparse_backend import dds, Matrix
+from sharpfin.sparse_backend import triton_dds, Matrix
 
 def _get_resize_kernel_triton(k: ResizeKernel):
     match k:
@@ -133,6 +134,7 @@ def create_tensor_metadata(
 @torch.compiler.disable
 def _get_nnz_and_buffers(tile_mask):
     num_sparse_blocks = torch.sum(tile_mask).item()
+
     return (
         num_sparse_blocks,
         [
@@ -162,7 +164,8 @@ def generate_sparse_matrix(dest_size, src_size, kernel_window=4.5, tile_size=64)
 
     # Needs to be item since used to create tensor shapes. Unavoidable.
     # Inductor also does not support pinned memory, need to create buffers outside of compile.
-    num_sparse_blocks, buffers = _get_nnz_and_buffers(tile_mask)
+    _, buffers = _get_nnz_and_buffers(tile_mask)
+    num_sparse_blocks = buffers[1].shape[0] # should be better for torch.compile
 
     # Pinned memory buffers created here will be the in the same memory locations ultimately used.
     # The transpose on the indices matrix is done so that row_indices and col_indices are contiguous
@@ -189,7 +192,7 @@ def generate_sparse_matrix(dest_size, src_size, kernel_window=4.5, tile_size=64)
 def compute_sparse_coord_grid_kernel(
     coords_source_ptr, coords_dest_ptr, sparse_data_ptr,
     row_indices_ptr, col_indices_ptr,
-    k, M, N, BLOCK_SIZE: tl.constexpr, SPARSE_BLOCK_SIZE: tl.constexpr
+    k: float, M: int, N: int, BLOCK_SIZE: tl.constexpr, SPARSE_BLOCK_SIZE: tl.constexpr
 ):
     SPARSE_BLOCK_NUMEL = SPARSE_BLOCK_SIZE * SPARSE_BLOCK_SIZE
     sparse_block = tl.program_id(0)
@@ -231,7 +234,8 @@ def compute_sparse_coord_grid_kernel(
     tl.store(sparse_block_ptr + store_offset, x)
 
 def compute_sparse_coord_grid(target_size, source_size, kernel_window, BLOCK_SIZE=32, SPARSE_BLOCK_SIZE = 64):
-    
+    target_size = target_size.shape[1]
+    source_size = source_size.shape[1]
     assert SPARSE_BLOCK_SIZE % BLOCK_SIZE == 0
 
     k = target_size / source_size
@@ -290,7 +294,127 @@ def compute_coord_grid(target_size, source_size, kernel_window=4.5, BLOCK_SIZE=3
     compute_coord_grid_kernel[grid](coords_source, coords_dest, coord_grid, k, M, N, BLOCK_SIZE)
     return coord_grid
 
+@triton.jit
+def srgb_to_linear_pad_replicate_kernel(
+    x_ptr, y_ptr,
+    M_X, N_X,
+    M_Y, N_Y,
+    M_PAD, N_PAD,
+    stride_xc, stride_xm, stride_xn,
+    stride_yc, stride_ym, stride_yn,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+):
+    
+    pid_c = tl.program_id(0)
+    pid_m = tl.program_id(1)
+    pid_n = tl.program_id(2)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_m_cl = tl.maximum(offs_m, M_PAD) - M_PAD
+    offs_m_cl = tl.minimum(offs_m_cl, M_X - 1)
+    offs_n_cl = tl.maximum(offs_n, N_PAD) - N_PAD
+    offs_n_cl = tl.minimum(offs_n_cl, N_X - 1)
+
+    mask_m = offs_m < M_Y
+    mask_n = offs_n < N_Y
+
+    x_block_ptrs = x_ptr + pid_c * stride_xc + offs_m_cl[:, None] * stride_xm + offs_n_cl[None, :] * stride_xn
+    y_block_ptrs = y_ptr + pid_c * stride_yc + offs_m[:, None] * stride_ym + offs_n[None, :] * stride_yn
+
+    x_vals = tl.load(x_block_ptrs)
+    y_vals = tl.where(
+        x_vals <= 0.04045,
+        x_vals / 12.92,
+        libdevice.pow((x_vals + 0.055) / 1.055, 2.4)
+    )
+
+    tl.store(y_block_ptrs, y_vals, mask=mask_m[:, None] & mask_n[None, :])
+
+def srgb_to_linear_pad_replicate(
+        img: torch.Tensor,
+        pad_h: int,
+        pad_w: int,
+        sparse_block_size: int = 0,
+    ):
+    C = img.shape[0]
+
+    M_PAD = pad_h
+    N_PAD = pad_w
+
+    if sparse_block_size != 0:
+        out_H = img.shape[-2] + M_PAD + (-(img.shape[-2] + M_PAD)) % sparse_block_size     # output image height
+        out_W = img.shape[-1] + N_PAD + (-(img.shape[-1] + N_PAD)) % sparse_block_size     # output image width
+    else:
+        out_H = img.shape[-2] + M_PAD + M_PAD
+        out_W = img.shape[-1] + N_PAD + N_PAD
+
+    out = torch.empty(C, out_H, out_W, dtype=img.dtype, device=img.device)
+
+    BLOCK_M = 1
+    BLOCK_N = 512
+
+    grid = lambda META: (
+        C,
+        (out.shape[1] + META['BLOCK_M'] - 1) // META['BLOCK_M'],
+        (out.shape[2] + META['BLOCK_N'] - 1) // META['BLOCK_N'],
+    )
+
+    srgb_to_linear_pad_replicate_kernel[grid](
+        img, out,
+        img.shape[1], img.shape[2],
+        out.shape[1], out.shape[2],
+        M_PAD, N_PAD,
+        img.stride(0), img.stride(1), img.stride(2),
+        out.stride(0), out.stride(1), out.stride(2),
+        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
+    )
+    return out
+
 @torch.compile
+def _downscale_sparse(
+        image: torch.Tensor,
+        target_size: Tuple[int, int],
+        t_w,
+        t_h,
+        s_w,
+        s_h,
+        resize_kernel: ResizeKernel = ResizeKernel.MAGIC_KERNEL_SHARP_2021,
+        BLOCK_SIZE: int = 32,
+        SPARSE_BLOCK_SIZE: int = 64,
+
+    ) -> torch.Tensor:
+    kernel, window = _get_resize_kernel_triton(resize_kernel)
+
+    T_W = t_w.shape[1]
+    T_H = t_h.shape[1]
+    S_W = s_w.shape[1]
+    S_H = s_h.shape[1]
+
+    y_s_w = compute_sparse_coord_grid(torch.empty(0, T_W), torch.empty(0, S_W), window, BLOCK_SIZE, SPARSE_BLOCK_SIZE)
+    y_s_h = compute_sparse_coord_grid(torch.empty(0, T_H), torch.empty(0, S_H), window, BLOCK_SIZE, SPARSE_BLOCK_SIZE)
+
+    PAD_W = math.ceil((window - 0.5) / (T_W / S_W))
+    PAD_H = math.ceil((window - 0.5) / (T_H / S_H))
+
+    # torch.compile has trouble tracing these shapes in original context
+    ysw_shape = ((math.ceil((S_W + PAD_W) / SPARSE_BLOCK_SIZE)) * SPARSE_BLOCK_SIZE, (math.ceil(T_W / SPARSE_BLOCK_SIZE)) * SPARSE_BLOCK_SIZE)
+    ysh_shape = ((math.ceil((S_H + PAD_H) / SPARSE_BLOCK_SIZE)) * SPARSE_BLOCK_SIZE, (math.ceil(T_H / SPARSE_BLOCK_SIZE)) * SPARSE_BLOCK_SIZE)
+
+    image = srgb_to_linear_pad_replicate(image, PAD_H, PAD_W, SPARSE_BLOCK_SIZE)
+
+    image = image.view(-1, image.shape[-1])
+    image = triton_dds(image, y_s_w, ysw_shape)
+    image = image.view(3, -1, image.shape[-1])
+    image = image.mT
+    image = image.reshape(-1, image.shape[-1])
+    image = triton_dds(image, y_s_h, ysh_shape, fuse_srgb=True)
+    image = image.view(3, -1, image.shape[-1])
+    image = image.mT
+    image = image[:, :T_H, :T_W]
+    image.clamp_(0.,1.)
+    return image
+
 def downscale_sparse(
         image: torch.Tensor,
         target_size: Tuple[int, int],
@@ -298,39 +422,22 @@ def downscale_sparse(
         BLOCK_SIZE: int = 32,
         SPARSE_BLOCK_SIZE: int = 64
     ) -> torch.Tensor:
-    kernel, window = _get_resize_kernel_triton(resize_kernel)
 
-    y_s_w = compute_sparse_coord_grid(target_size[-1], image.shape[-1], window, BLOCK_SIZE, SPARSE_BLOCK_SIZE)
-    y_s_h = compute_sparse_coord_grid(target_size[-2], image.shape[-2], window, BLOCK_SIZE, SPARSE_BLOCK_SIZE)
+    T_W = torch.empty(0, target_size[-1])
+    T_H = torch.empty(0, target_size[-2])
+    S_W = torch.empty(0, image.shape[-1])
+    S_H = torch.empty(0, image.shape[-2])
+    torch._dynamo.mark_dynamic(T_W, 1)
+    torch._dynamo.mark_dynamic(T_H, 1)
+    torch._dynamo.mark_dynamic(S_W, 1)
+    torch._dynamo.mark_dynamic(S_H, 1)
 
-    PAD_W = math.ceil((window - 0.5) / (target_size[-1] / image.shape[-1]))
-    PAD_H = math.ceil((window - 0.5) / (target_size[-2] / image.shape[-2]))
+    return _downscale_sparse(image, target_size, T_W, T_H, S_W, S_H, resize_kernel, BLOCK_SIZE, SPARSE_BLOCK_SIZE)
 
-    image = srgb_to_linear(image)
-
-    image = F.pad(image, (
-        PAD_W,
-        y_s_w.shape[0] - image.shape[-1] - PAD_W,
-        PAD_H,
-        y_s_h.shape[0] - image.shape[-2] - PAD_H
-    ), mode='replicate')
-
-    image = image.view(-1, image.shape[-1])
-    image = dds(image, y_s_w)
-    image = image.view(3, -1, image.shape[-1])
-    image = image.mT
-    image = image.reshape(-1, image.shape[-1])
-    image = dds(image, y_s_h, fuse_srgb=True)
-    image = image.view(3, -1, image.shape[-1])
-    image = image.mT
-    image = image[:, :target_size[0], :target_size[1]]
-    image.clamp_(0.,1.)
-    return image
-
-@torch.compile
+@torch.compile(backend='eager')
 def downscale_triton(
         image: torch.Tensor,
-        target_size: Tuple[int, int],
+        target_size: torch.Size,
         resize_kernel: ResizeKernel = ResizeKernel.MAGIC_KERNEL_SHARP_2021,
     ) -> torch.Tensor:
     kernel, window = _get_resize_kernel_triton(resize_kernel)
@@ -341,14 +448,15 @@ def downscale_triton(
     PAD_W = math.ceil((window - 0.5) / (target_size[-1] / image.shape[-1]))
     PAD_H = math.ceil((window - 0.5) / (target_size[-2] / image.shape[-2]))
 
-    image = srgb_to_linear(image)
+    # image = srgb_to_linear(image)
 
-    image = F.pad(image, (
-        PAD_W,
-        y_s_w.shape[0] - image.shape[-1] - PAD_W,
-        PAD_H,
-        y_s_h.shape[0] - image.shape[-2] - PAD_H
-    ), mode='replicate')
+    # image = F.pad(image, (
+    #     PAD_W,
+    #     y_s_w.shape[0] - image.shape[-1] - PAD_W,
+    #     PAD_H,
+    #     y_s_h.shape[0] - image.shape[-2] - PAD_H
+    # ), mode='replicate')
+    image = srgb_to_linear_pad_replicate(image, PAD_H, PAD_W)
 
     image = image.view(-1, image.shape[-1])
     image = image @ y_s_w

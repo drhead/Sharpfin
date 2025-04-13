@@ -388,22 +388,12 @@ def downscale_sparse(
     PAD_W = math.ceil((window - 0.5) / (T_W / S_W))
     PAD_H = math.ceil((window - 0.5) / (T_H / S_H))
 
-    # torch.compile has trouble tracing these shapes in original context
-    ysw_shape = ((math.ceil((S_W + PAD_W) / SPARSE_BLOCK_SIZE)) * SPARSE_BLOCK_SIZE, (math.ceil(T_W / SPARSE_BLOCK_SIZE)) * SPARSE_BLOCK_SIZE)
-    ysh_shape = ((math.ceil((S_H + PAD_H) / SPARSE_BLOCK_SIZE)) * SPARSE_BLOCK_SIZE, (math.ceil(T_H / SPARSE_BLOCK_SIZE)) * SPARSE_BLOCK_SIZE)
-
     image = srgb_to_linear_pad_replicate(image, PAD_H, PAD_W, SPARSE_BLOCK_SIZE)
 
-    image = image.view(-1, image.shape[-1])
-    image = triton_dds(image, y_s_w, ysw_shape)
-    image = image.view(3, -1, image.shape[-1])
-    image = image.mT
-    image = image.reshape(-1, image.shape[-1])
-    image = triton_dds(image, y_s_h, ysh_shape, fuse_srgb=True)
-    image = image.view(3, -1, image.shape[-1])
-    image = image.mT
-    image = image[:, :T_H, :T_W]
-    image.clamp_(0.,1.)
+    image = triton_dds(image, y_s_w, output_mt=True)
+
+    image = triton_dds(image, y_s_h, fuse_srgb=True, fuse_clamp=True, output_mt=True, output_slice=(T_H, T_W))
+
     return image
 
 def downscale_triton(

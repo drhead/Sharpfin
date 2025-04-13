@@ -2,6 +2,7 @@ import numpy as np
 import torch
 import triton
 import triton.language as tl
+from typing import Tuple
 from dataclasses import dataclass
 from .triton_functional import linear_to_srgb_triton
 
@@ -99,7 +100,6 @@ def _validate_matrix(shape, data, row_indices, column_indices, offsets):
             f"Expected int32 offsets. Got {offsets.dtype} offsets.")
     return data
 
-
 def _transpose(size, data: torch.Tensor, row_indices: torch.Tensor, column_indices: torch.Tensor, offsets):
     block_columns = size[1] // data.shape[1]
 
@@ -120,7 +120,6 @@ def _transpose(size, data: torch.Tensor, row_indices: torch.Tensor, column_indic
     offsets_t = torch.cat([zero, nnz_per_column.cumsum(0, dtype=torch.int32)])
     return column_indices_t, offsets_t, block_offsets_t
 
-
 class Matrix(torch.nn.Module):
     """A matrix stored in sparse format.
 
@@ -131,13 +130,13 @@ class Matrix(torch.nn.Module):
 
     def __init__(self,
                  size,
-                 data,
-                 row_indices,
-                 column_indices,
-                 offsets,
-                 column_indices_t=None,
-                 offsets_t=None,
-                 block_offsets_t=None):
+                 data: torch.Tensor,
+                 row_indices: torch.Tensor,
+                 column_indices: torch.Tensor,
+                 offsets: torch.Tensor,
+                 column_indices_t: torch.Tensor=None,
+                 offsets_t: torch.Tensor=None,
+                 block_offsets_t: torch.Tensor=None):
         super().__init__()
         self._size = size
         self._data = data
@@ -381,22 +380,25 @@ class TritonConfig:
     key=['M', 'N', 'K'],
 )
 @triton.jit
-def _dds_kernel(A, B, C, M, N, K,
-            stride_am, stride_ak,
-            stride_bk, stride_bn,
-            stride_cm, stride_cn,
-            row_indices, column_indices, offsets,
-            block_offsets_t, trans_A: tl.constexpr, trans_B: tl.constexpr, fuse_srgb: tl.constexpr,
-            BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
-            BLOCK_SIZE: tl.constexpr, GROUP_M: tl.constexpr, ACC_TYPE: tl.constexpr,
-            ):
+def _dds_kernel(
+        A: tl.tensor, B: tl.tensor, C: tl.tensor, M, N, K, O_M, O_N,
+        stride_ac, stride_am, stride_ak,
+        stride_bk, stride_bn,
+        stride_cc, stride_cm, stride_cn,
+        row_indices: tl.tensor, column_indices: tl.tensor,
+        offsets: tl.tensor, block_offsets_t: tl.tensor,
+        trans_A: tl.constexpr, trans_B: tl.constexpr, fuse_srgb: tl.constexpr,
+        BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+        BLOCK_SIZE: tl.constexpr, GROUP_M: tl.constexpr, ACC_TYPE: tl.constexpr,
+    ):
 
     # matrix multiplication
-    pid_m = tl.program_id(0)
-    pid_n = tl.program_id(1)
+    pid_c = tl.program_id(0)
+    pid_m = tl.program_id(1)
+    pid_n = tl.program_id(2)
 
-    num_pid_m = tl.num_programs(0)
-    num_pid_n = tl.num_programs(1)
+    num_pid_m = tl.num_programs(1)
+    num_pid_n = tl.num_programs(2)
 
     pid_n, pid_m = tl.swizzle2d(pid_n, pid_m, num_pid_n, num_pid_m, GROUP_M)
     start_inx = tl.load(offsets + pid_n)
@@ -406,7 +408,7 @@ def _dds_kernel(A, B, C, M, N, K,
 
     # block pointer to dense matrix improves L1 cache efficiency
     A_block_ptr = tl.make_block_ptr(
-        base=A, shape=(M, K), strides=(stride_am, stride_ak),
+        base=A + pid_c * stride_ac, shape=(M, K), strides=(stride_am, stride_ak),
         offsets=(pid_m * BLOCK_M, 0), block_shape=(BLOCK_M, BLOCK_K),
         order=(0, 1)
     )
@@ -445,42 +447,77 @@ def _dds_kernel(A, B, C, M, N, K,
 
     acc = acc.to(C.dtype.element_ty)
     if fuse_srgb:
-        acc = linear_to_srgb_triton(acc)
+        acc = tl.clamp(linear_to_srgb_triton(acc), 0.0, 1.0)
+
     cm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     cn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
 
-    mask_C = (cm < M)[:, None] & (cn < N)[None, :]
-    C = C + (cm[:, None] * stride_cm + cn[None, :] * stride_cn)
+    mask_C = (cm < O_M)[:, None] & (cn < O_N)[None, :]
+    C = C + pid_c * stride_cc + (cm[:, None] * stride_cm + cn[None, :] * stride_cn)
 
     tl.store(C, acc, mask=mask_C)
 
 def triton_dds(
         lhs: torch.Tensor,
         rhs: Matrix,
-        shape,
         fuse_srgb: bool = False,
+        output_mt: bool = False,
+        output_slice: None | Tuple[int,int] = None
     ):
     assert isinstance(lhs, torch.Tensor)
     assert isinstance(rhs, Matrix)
+    assert lhs.ndim == 3
+    CH = lhs.shape[0]
+    stride_ac = lhs.stride(0)
 
-    out = torch.empty(
-        (lhs.size()[0], shape[1]),
-        dtype=lhs.dtype,
-        device=lhs.device
-    )
+    M, K = lhs.shape[-2:]
+    N = rhs.shape[-1]
+
+    if output_mt:
+        # output = N, M
+        if output_slice is not None:
+            O_N, O_M = output_slice
+            out = torch.empty(
+                (*lhs.shape[:-2], *output_slice),
+                dtype=lhs.dtype,
+                device=lhs.device
+            )
+        else:
+            O_N, O_M = N, M
+            out = torch.empty(
+                (*lhs.shape[:-2], rhs.shape[1], lhs.shape[-2]),
+                dtype=lhs.dtype,
+                device=lhs.device
+            )
+        stride_cm, stride_cn = out.stride(-1), out.stride(-2)
+        stride_cc = out.stride(-3)
+    else:
+        # output = M, N
+        if output_slice is not None:
+            O_M, O_N = output_slice
+            out = torch.empty(
+                (*lhs.shape[:-2], *output_slice),
+                dtype=lhs.dtype,
+                device=lhs.device
+            )
+        else:
+            O_M, O_N = M, N
+            out = torch.empty(
+                (*lhs.shape[:-1], rhs.shape[1]),
+                dtype=lhs.dtype,
+                device=lhs.device
+            )
+        stride_cm, stride_cn = out.stride(-2), out.stride(-1)
+        stride_cc = out.stride(-3)
 
     trans_B = not rhs.is_contiguous()
-    trans_A = (lhs.stride(0) > 1 and lhs.stride(1) > 1)
+    trans_A = (lhs.stride(-2) > 1 and lhs.stride(-1) > 1)
+    assert trans_A == False
 
     # checks constraints
-    assert lhs.shape[1] <= shape[0], "incompatible dimensions" # changed to LTE to allow padded RHS
-    M, K = lhs.shape
-    _, N = shape
+    assert lhs.shape[-1] <= rhs.shape[0], "incompatible dimensions" # changed to LTE to allow padded RHS
 
-    if trans_A:
-        stride_am, stride_ak = lhs.stride(1), lhs.stride(0)
-    else:
-        stride_am, stride_ak = lhs.stride(0), lhs.stride(1)
+    stride_am, stride_ak = lhs.stride(-2), lhs.stride(-1)
 
     if trans_B:
         stride_bk, stride_bn = rhs.data.stride(2), rhs.data.stride(1)
@@ -490,16 +527,16 @@ def triton_dds(
         b_column_indices, b_offsets = rhs.column_indices_t, rhs.offsets_t
 
     # launch kernel
-    grid = lambda META: (triton.cdiv(M, META['BLOCK_M']), triton.cdiv(N, META['BLOCK_N']))
+    grid = lambda META: (CH, triton.cdiv(M, META['BLOCK_M']), triton.cdiv(N, META['BLOCK_N']))
 
     _dds_kernel[grid](
-        lhs, rhs.data, out, M, N, K,
-        stride_am, stride_ak,
+        lhs, rhs.data, out, M, N, K, O_M, O_N,
+        stride_ac, stride_am, stride_ak,
         stride_bk, stride_bn,
-        out.stride(0), out.stride(1),
+        stride_cc, stride_cm, stride_cn,
         rhs.row_indices, b_column_indices, b_offsets,
         rhs.block_offsets_t, trans_A, trans_B, fuse_srgb,
         GROUP_M=128, ACC_TYPE=tl.float16, BLOCK_M=64,
-        BLOCK_N=rhs.data.shape[1], BLOCK_SIZE=rhs.data.shape[1], BLOCK_K=min(rhs.data.shape[1], 32)
+        BLOCK_N=rhs.data.shape[1], BLOCK_SIZE=rhs.data.shape[1], BLOCK_K=min(rhs.data.shape[1], 64)
     )
     return out

@@ -23,7 +23,7 @@ Note regarding use of GPU resources: A high-resolution image (6000x6000) would u
 #### **NEW** (4/10/2025): Sparsity Support
 A custom Triton implementation of the resizing engine has now been added, making use of sparsity to avoid a sizeable portion of the matmul operation. This reduces the computational complexity for each resizing matmul from O(MNK) to O(NK). Sparsity code is adapted from stanford-futuredata/stk with changes mainly oriented at allowing more flexibility for input shapes.
 
-Benchmarking shows that this approach is around **7x faster** than the naive GPU implementation and **1000x*** faster than the naive CPU matmul resize. Compared to F.interpolate (and only comparing with the resizing portion alone as F.interpolate does not have fused linear RGB conversion), the sparse GPU resizing engine is **2-3x** faster than F.interpolate with bicubic and antialiasing. The entire pipeline (including the padding and color conversion) will run in 2/3rds of the time it takes for F.interpolate to run.
+Benchmarking shows that this approach is around **7x faster** than the naive GPU implementation and **1000x** faster than the naive CPU matmul resize. Compared to F.interpolate (and only comparing with the resizing portion alone as F.interpolate does not have fused linear RGB conversion), the sparse GPU resizing engine is **2-3x** faster than F.interpolate with bicubic and antialiasing. The entire pipeline (including the padding and color conversion) will run in 2/3rds of the time it takes for F.interpolate to run.
 
 ### SFT.ApplyCMS
 `SFT.ApplyCMS` is intended to make proper color management of images as effortless as possible. Original implementation is largely made by @redhottensors.

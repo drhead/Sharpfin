@@ -9,8 +9,6 @@ import torch.nn.functional as F
 from triton.language.extra import libdevice
 from sharpfin.util import linear_to_srgb, srgb_to_linear
 
-
-
 # Magic Kernel Sharp modified to operate in-place on negative values
 # For some reason doing it this way is slightly faster, but less readable.
 @triton.jit
@@ -105,30 +103,26 @@ def create_tensor_metadata(
         num_sparse_blocks: int, 
         tile_mask: torch.Tensor,
         indices: torch.Tensor,
-        block_offsets_t: torch.Tensor,
-        col_indices_t: torch.Tensor,
+        # block_offsets_t: torch.Tensor,
+        # col_indices_t: torch.Tensor,
         offsets: torch.Tensor,
         offsets_t: torch.Tensor,
     ):
 
     # could this run on cuda? yes (on pytorch 2.6). is it worth running on cuda? *no*.
-    torch.nonzero_static(tile_mask, size=num_sparse_blocks, out=indices)
-
-    # these are contiguous and pinned because we transposed the buffer
-    row_indices = indices[:,0] # type: torch.Tensor
-    col_indices = indices[:,1] # type: torch.Tensor
+    torch.nonzero_static(tile_mask, size=num_sparse_blocks, out=indices[:,:2]) # row_indices, col_indices
 
     # Strangely, being unstable is better for kernel performance.
     # Stable will cause warp stalls.
-    torch.argsort(col_indices, stable=False, out=block_offsets_t)
-    torch.take(row_indices, block_offsets_t, out=col_indices_t)
+    torch.argsort(indices[:,1], stable=False, out=indices[:,2]) # block_offsets_t
+    torch.take(indices[:,0], indices[:,2], out=indices[:,3]) # col_indices_t
 
     # reusing the offsets buffer here helps performance
     torch.sum(tile_mask, dim=1, out=offsets[1:])
     torch.sum(tile_mask, dim=0, out=offsets_t[1:])
     torch.cumsum(offsets, dim=0, out=offsets)
     torch.cumsum(offsets_t, dim=0, out=offsets_t)
-    return row_indices, col_indices, block_offsets_t, col_indices_t, offsets, offsets_t
+    return indices, offsets, offsets_t
 
 # for isolating the one mandatory graph break
 @torch.compiler.disable
@@ -138,11 +132,13 @@ def _get_nnz_and_buffers(tile_mask):
     return (
         num_sparse_blocks,
         [
-            torch.empty((2, num_sparse_blocks), dtype=torch.int64, pin_memory=True).T, # indices
-            torch.empty((num_sparse_blocks,), dtype=torch.int64, pin_memory=True), #block_offsets_t
-            torch.empty((num_sparse_blocks,), dtype=torch.int64, pin_memory=True), #col_indices_t
-            torch.zeros((tile_mask.shape[0] + 1,), dtype=torch.int32, pin_memory=True), #offsets
-            torch.zeros((tile_mask.shape[1] + 1,), dtype=torch.int32, pin_memory=True) #offsets_t
+            # Creating all the index buffers as a single tensor helps greatly with memory transfers.
+            # Since we are transposing it at the start, each index will still be contiguous once sliced.
+            # offsets/offsets_t could be joined too despite their mismatched shapes, but it makes 
+            # torch.compile unhappy and yields no noticeable performance benefit.
+            torch.empty((4, num_sparse_blocks), dtype=torch.int64, pin_memory=True).T, # indices
+            torch.zeros((tile_mask.shape[0] + 1,), dtype=torch.int32, pin_memory=True), # offsets
+            torch.zeros((tile_mask.shape[1] + 1,), dtype=torch.int32, pin_memory=True) # offsets_t
         ]
     )
 
@@ -165,27 +161,29 @@ def generate_sparse_matrix(dest_size, src_size, kernel_window=4.5, tile_size=64)
     # Needs to be item since used to create tensor shapes. Unavoidable.
     # Inductor also does not support pinned memory, need to create buffers outside of compile.
     _, buffers = _get_nnz_and_buffers(tile_mask)
-    num_sparse_blocks = buffers[1].shape[0] # should be better for torch.compile
+    num_sparse_blocks = buffers[0].shape[0] # should be better for torch.compile
 
     # Pinned memory buffers created here will be the in the same memory locations ultimately used.
     # The transpose on the indices matrix is done so that row_indices and col_indices are contiguous
     # when assigned from the results of nonzero, which makes the following copy to GPU faster.
-    row_indices, col_indices, block_offsets_t, col_indices_t, offsets, offsets_t = create_tensor_metadata(
+    indices, offsets, offsets_t = create_tensor_metadata(
         num_sparse_blocks,
         tile_mask,
         *buffers
     )
 
+    indices = indices.to(device='cuda', dtype=torch.int32, non_blocking=True)
+
     # Create sparse tensor
     return Matrix(
         (tile_mask.shape[0] * tile_size, tile_mask.shape[1] * tile_size),
         torch.empty(num_sparse_blocks, tile_size, tile_size, dtype=torch.float16, device='cuda'),
-        row_indices.to(device='cuda', dtype=torch.int32, non_blocking=True),
-        col_indices.to(device='cuda', dtype=torch.int32, non_blocking=True),
-        offsets.to(device='cuda', dtype=torch.int32, non_blocking=True),
-        column_indices_t=col_indices_t.to(device='cuda', dtype=torch.int32, non_blocking=True),
+        row_indices=indices[:,0],
+        column_indices=indices[:,1],
+        offsets=offsets.to(device='cuda', dtype=torch.int32, non_blocking=True),
+        column_indices_t=indices[:,3],
         offsets_t=offsets_t.to(device='cuda', dtype=torch.int32, non_blocking=True),
-        block_offsets_t=block_offsets_t.to(device='cuda', dtype=torch.int32, non_blocking=True)
+        block_offsets_t=indices[:,2]
     )
 
 @triton.jit
@@ -233,9 +231,7 @@ def compute_sparse_coord_grid_kernel(
 
     tl.store(sparse_block_ptr + store_offset, x)
 
-def compute_sparse_coord_grid(target_size, source_size, kernel_window, BLOCK_SIZE=32, SPARSE_BLOCK_SIZE = 64):
-    target_size = target_size.shape[1]
-    source_size = source_size.shape[1]
+def compute_sparse_coord_grid(target_size, source_size, kernel_window, BLOCK_SIZE=32, SPARSE_BLOCK_SIZE=64):
     assert SPARSE_BLOCK_SIZE % BLOCK_SIZE == 0
 
     k = target_size / source_size
@@ -371,14 +367,9 @@ def srgb_to_linear_pad_replicate(
     )
     return out
 
-@torch.compile
-def _downscale_sparse(
+def downscale_sparse(
         image: torch.Tensor,
         target_size: Tuple[int, int],
-        t_w,
-        t_h,
-        s_w,
-        s_h,
         resize_kernel: ResizeKernel = ResizeKernel.MAGIC_KERNEL_SHARP_2021,
         BLOCK_SIZE: int = 32,
         SPARSE_BLOCK_SIZE: int = 64,
@@ -386,13 +377,13 @@ def _downscale_sparse(
     ) -> torch.Tensor:
     kernel, window = _get_resize_kernel_triton(resize_kernel)
 
-    T_W = t_w.shape[1]
-    T_H = t_h.shape[1]
-    S_W = s_w.shape[1]
-    S_H = s_h.shape[1]
+    T_W = target_size[-1]
+    T_H = target_size[-2]
+    S_W = image.shape[-1]
+    S_H = image.shape[-2]
 
-    y_s_w = compute_sparse_coord_grid(torch.empty(0, T_W), torch.empty(0, S_W), window, BLOCK_SIZE, SPARSE_BLOCK_SIZE)
-    y_s_h = compute_sparse_coord_grid(torch.empty(0, T_H), torch.empty(0, S_H), window, BLOCK_SIZE, SPARSE_BLOCK_SIZE)
+    y_s_w = compute_sparse_coord_grid(T_W, S_W, window, BLOCK_SIZE, SPARSE_BLOCK_SIZE)
+    y_s_h = compute_sparse_coord_grid(T_H, S_H, window, BLOCK_SIZE, SPARSE_BLOCK_SIZE)
 
     PAD_W = math.ceil((window - 0.5) / (T_W / S_W))
     PAD_H = math.ceil((window - 0.5) / (T_H / S_H))
@@ -415,26 +406,6 @@ def _downscale_sparse(
     image.clamp_(0.,1.)
     return image
 
-def downscale_sparse(
-        image: torch.Tensor,
-        target_size: Tuple[int, int],
-        resize_kernel: ResizeKernel = ResizeKernel.MAGIC_KERNEL_SHARP_2021,
-        BLOCK_SIZE: int = 32,
-        SPARSE_BLOCK_SIZE: int = 64
-    ) -> torch.Tensor:
-
-    T_W = torch.empty(0, target_size[-1])
-    T_H = torch.empty(0, target_size[-2])
-    S_W = torch.empty(0, image.shape[-1])
-    S_H = torch.empty(0, image.shape[-2])
-    torch._dynamo.mark_dynamic(T_W, 1)
-    torch._dynamo.mark_dynamic(T_H, 1)
-    torch._dynamo.mark_dynamic(S_W, 1)
-    torch._dynamo.mark_dynamic(S_H, 1)
-
-    return _downscale_sparse(image, target_size, T_W, T_H, S_W, S_H, resize_kernel, BLOCK_SIZE, SPARSE_BLOCK_SIZE)
-
-@torch.compile(backend='eager')
 def downscale_triton(
         image: torch.Tensor,
         target_size: torch.Size,
@@ -448,14 +419,6 @@ def downscale_triton(
     PAD_W = math.ceil((window - 0.5) / (target_size[-1] / image.shape[-1]))
     PAD_H = math.ceil((window - 0.5) / (target_size[-2] / image.shape[-2]))
 
-    # image = srgb_to_linear(image)
-
-    # image = F.pad(image, (
-    #     PAD_W,
-    #     y_s_w.shape[0] - image.shape[-1] - PAD_W,
-    #     PAD_H,
-    #     y_s_h.shape[0] - image.shape[-2] - PAD_H
-    # ), mode='replicate')
     image = srgb_to_linear_pad_replicate(image, PAD_H, PAD_W)
 
     image = image.view(-1, image.shape[-1])

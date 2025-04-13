@@ -392,7 +392,7 @@ def downscale_sparse(
 
     image = triton_dds(image, y_s_w, output_mt=True)
 
-    image = triton_dds(image, y_s_h, fuse_srgb=True, fuse_clamp=True, output_mt=True, output_slice=(T_H, T_W))
+    image = triton_dds(image, y_s_h, fuse_srgb=True, output_mt=True, output_slice=(T_H, T_W))
 
     return image
 

@@ -393,9 +393,9 @@ def _dds_kernel(
     ):
 
     # matrix multiplication
-    pid_c = tl.program_id(0)
-    pid_m = tl.program_id(1)
-    pid_n = tl.program_id(2)
+    pid_c = tl.program_id(0) # channel axis
+    pid_m = tl.program_id(1) # block M axis
+    pid_n = tl.program_id(2) # block N axis
 
     num_pid_m = tl.num_programs(1)
     num_pid_n = tl.num_programs(2)
@@ -406,12 +406,10 @@ def _dds_kernel(
 
     BLOCK_ELEMENTS = BLOCK_SIZE * BLOCK_SIZE
 
-    # block pointer to dense matrix improves L1 cache efficiency
-    A_block_ptr = tl.make_block_ptr(
-        base=A + pid_c * stride_ac, shape=(M, K), strides=(stride_am, stride_ak),
-        offsets=(pid_m * BLOCK_M, 0), block_shape=(BLOCK_M, BLOCK_K),
-        order=(0, 1)
-    )
+    rm = tl.arange(0, BLOCK_M) + pid_m * BLOCK_M
+    rak = tl.arange(0, BLOCK_K)
+
+    A += (rm[:, None] * stride_am + rak[None, :] * stride_ak) + pid_c * stride_ac
 
     # pointers to sparse matrix
     rn = tl.arange(0, BLOCK_N)
@@ -428,24 +426,24 @@ def _dds_kernel(
     bk_sub_incr = BLOCK_K * stride_bk
 
     for block_inx in range(end_inx - start_inx):
-        a_col_idx = tl.load(column_indices + start_inx + block_inx)
-        A_ptr = tl.advance(A_block_ptr, (0, a_col_idx * ak_block_incr))
-
         if trans_B:
             b_block_offset = (start_inx + block_inx)
         else:
             b_block_offset = tl.load(block_offsets_t + start_inx + block_inx)
 
-        for sub_block_inx in range(nsub_blocks):
-            ptr_B = B + b_block_offset * BLOCK_ELEMENTS + sub_block_inx * bk_sub_incr
+        ptr_A = A + tl.load(column_indices + start_inx + block_inx) * ak_block_incr
+        ptr_B = B + b_block_offset * BLOCK_ELEMENTS 
 
-            a = tl.load(A_ptr)
+        for sub_block_inx in range(nsub_blocks):
+            a = tl.load(ptr_A)
             b = tl.load(ptr_B)
             acc = tl.dot(a, b, acc, out_dtype=tl.float16)
 
-            A_ptr = tl.advance(A_ptr, (0, ak_sub_incr))
+            ptr_A += sub_block_inx * ak_sub_incr
+            ptr_B += sub_block_inx * bk_sub_incr
 
     acc = acc.to(C.dtype.element_ty)
+
     if fuse_srgb:
         acc = tl.clamp(linear_to_srgb_triton(acc), 0.0, 1.0)
 

@@ -24,15 +24,19 @@ def magic_kernel_sharp_2021_triton(x):
 
 @triton.jit
 def linear_to_srgb_triton(x):
-    return tl.where(x <= 0.0031308, 
-                    x * 12.92,
-                    1.055 * libdevice.pow(x, 1/2.4) - 0.055)
+    return tl.where(
+        x <= 0.0031308, 
+        x * 12.92,
+        1.055 * libdevice.fast_powf(x, 1/2.4) - 0.055
+    )
 
 @triton.jit
 def srgb_to_linear_triton(x):
-    return tl.where(x <= 0.04045, 
-                    x / 12.92,
-                    libdevice.pow((x + 0.055) / 1.055, 2.4))
+    return tl.where(
+        x <= 0.04045, 
+        x / 12.92,
+        libdevice.fast_powf((x + 0.055) / 1.055, 2.4)
+    )
 
 from sharpfin.sparse_backend import triton_dds, Matrix
 
@@ -319,11 +323,7 @@ def srgb_to_linear_pad_replicate_kernel(
     y_block_ptrs = y_ptr + pid_c * stride_yc + offs_m[:, None] * stride_ym + offs_n[None, :] * stride_yn
 
     x_vals = tl.load(x_block_ptrs)
-    y_vals = tl.where(
-        x_vals <= 0.04045,
-        x_vals / 12.92,
-        libdevice.pow((x_vals + 0.055) / 1.055, 2.4)
-    )
+    y_vals = srgb_to_linear_triton(x_vals)
 
     tl.store(y_block_ptrs, y_vals, mask=mask_m[:, None] & mask_n[None, :])
 

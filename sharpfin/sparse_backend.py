@@ -386,8 +386,7 @@ def _dds_kernel(
         stride_bk, stride_bn,
         stride_cc, stride_cm, stride_cn,
         row_indices: tl.tensor, column_indices: tl.tensor,
-        offsets: tl.tensor, block_offsets_t: tl.tensor,
-        trans_A: tl.constexpr, trans_B: tl.constexpr, fuse_srgb: tl.constexpr,
+        offsets: tl.tensor, block_offsets_t: tl.tensor,  fuse_srgb: tl.constexpr,
         BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
         BLOCK_SIZE: tl.constexpr, GROUP_M: tl.constexpr, ACC_TYPE: tl.constexpr,
     ):
@@ -406,10 +405,13 @@ def _dds_kernel(
 
     BLOCK_ELEMENTS = BLOCK_SIZE * BLOCK_SIZE
 
-    rm = tl.arange(0, BLOCK_M) + pid_m * BLOCK_M
-    rak = tl.arange(0, BLOCK_K)
-
-    A += (rm[:, None] * stride_am + rak[None, :] * stride_ak) + pid_c * stride_ac
+    A_block_ptr = tl.make_block_ptr(
+        base=A + pid_c * stride_ac, shape=(M, K),
+        strides=(stride_am, stride_ak),
+        offsets=(pid_m * BLOCK_M, 0),
+        block_shape=(BLOCK_M, BLOCK_K),
+        order=(0, 1)
+    )
 
     # pointers to sparse matrix
     rn = tl.arange(0, BLOCK_N)
@@ -418,42 +420,42 @@ def _dds_kernel(
     B += (rbk[:, None] * stride_bk + rn[None, :] * stride_bn)
 
     # do matrix multiplication
-    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=ACC_TYPE)
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float16)
     nsub_blocks = tl.cdiv(BLOCK_SIZE, BLOCK_K)
 
-    ak_sub_incr = BLOCK_K * stride_ak
-    ak_block_incr = BLOCK_SIZE * stride_ak
     bk_sub_incr = BLOCK_K * stride_bk
 
     for block_inx in range(end_inx - start_inx):
-        if trans_B:
-            b_block_offset = (start_inx + block_inx)
-        else:
-            b_block_offset = tl.load(block_offsets_t + start_inx + block_inx)
+        a_col_idx = tl.load(column_indices + start_inx + block_inx)
+        ptr_A = tl.advance(A_block_ptr, (0, a_col_idx * BLOCK_SIZE))
 
-        ptr_A = A + tl.load(column_indices + start_inx + block_inx) * ak_block_incr
-        ptr_B = B + b_block_offset * BLOCK_ELEMENTS 
+        b_block_offset = tl.load(block_offsets_t + start_inx + block_inx)
+        ptr_B = B + b_block_offset * BLOCK_ELEMENTS
 
         for sub_block_inx in range(nsub_blocks):
             a = tl.load(ptr_A)
             b = tl.load(ptr_B)
+
             acc = tl.dot(a, b, acc, out_dtype=tl.float16)
 
-            ptr_A += sub_block_inx * ak_sub_incr
-            ptr_B += sub_block_inx * bk_sub_incr
-
-    acc = acc.to(C.dtype.element_ty)
+            ptr_A = tl.advance(ptr_A, (0, BLOCK_K))
+            ptr_B += bk_sub_incr
 
     if fuse_srgb:
         acc = tl.clamp(linear_to_srgb_triton(acc), 0.0, 1.0)
 
-    cm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    cn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    acc = acc.to(C.dtype.element_ty)
 
-    mask_C = (cm < O_M)[:, None] & (cn < O_N)[None, :]
-    C = C + pid_c * stride_cc + (cm[:, None] * stride_cm + cn[None, :] * stride_cn)
+    C_block_ptr = tl.make_block_ptr(
+        base=C + pid_c * stride_cc, shape=(O_M, O_N),
+        strides=(stride_cm, stride_cn),
+        offsets=(pid_m * BLOCK_M, pid_n * BLOCK_N),
+        block_shape=(BLOCK_M, BLOCK_N),
+        order=(1, 0)
+    )
 
-    tl.store(C, acc, mask=mask_C)
+    tl.store(C_block_ptr, acc, boundary_check=(0, 1), cache_modifier=".cs")
+
 
 def triton_dds(
         lhs: torch.Tensor,
@@ -510,7 +512,7 @@ def triton_dds(
 
     trans_B = not rhs.is_contiguous()
     trans_A = (lhs.stride(-2) > 1 and lhs.stride(-1) > 1)
-    assert trans_A == False
+    assert trans_A == False, trans_B == False
 
     # checks constraints
     assert lhs.shape[-1] <= rhs.shape[0], "incompatible dimensions" # changed to LTE to allow padded RHS
@@ -533,7 +535,7 @@ def triton_dds(
         stride_bk, stride_bn,
         stride_cc, stride_cm, stride_cn,
         rhs.row_indices, b_column_indices, b_offsets,
-        rhs.block_offsets_t, trans_A, trans_B, fuse_srgb,
+        rhs.block_offsets_t, fuse_srgb,
         GROUP_M=128, ACC_TYPE=tl.float16, BLOCK_M=64,
         BLOCK_N=rhs.data.shape[1], BLOCK_SIZE=rhs.data.shape[1], BLOCK_K=min(rhs.data.shape[1], 64)
     )

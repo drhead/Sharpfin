@@ -196,7 +196,7 @@ def _upscale_axis(
 
     return image @ weights
 
-@torch.compile(disable=False)
+@torch.compile
 def _downscale(
         image: torch.Tensor,
         out_res: tuple[int, int],
@@ -218,7 +218,7 @@ def _downscale(
     image = image.clamp(0,1)
     return image
 
-@torch.compile(disable=False)
+@torch.compile
 def _upscale(
         image: torch.Tensor,
         out_res: tuple[int, int],

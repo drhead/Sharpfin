@@ -12,8 +12,8 @@ from sharpfin.util import linear_to_srgb, srgb_to_linear
 # Magic Kernel Sharp modified to operate in-place on negative values
 # For some reason doing it this way is slightly faster, but less readable.
 @triton.jit
-def magic_kernel_sharp_2021_triton(x):
-    x = -tl.abs(x)
+def magic_kernel_sharp_2021_triton(x: tl.tensor) -> tl.tensor:
+    x = libdevice.copysign(x, -1.) # equivalent to -tl.abs(x), less ops
     x = tl.where(x >= -0.5, (577/576) - (239/144) * (x * x), x)
     x = tl.where(x < -0.5 and x >= -1.5, (35/36) * (x + 1) * (x + 239/140), x)
     x = tl.where(x < -1.5 and x >= -2.5, -(1/6) * (x + 2) * (65/24 + x), x)
@@ -22,10 +22,11 @@ def magic_kernel_sharp_2021_triton(x):
     x = tl.where(x < -4.5, 0, x)
     return x
 
+# NOTE: libdevice.fast_powf mostly just clips subnormals compared to libdevice.pow
 @triton.jit
 def linear_to_srgb_triton(x):
     return tl.where(
-        x <= 0.0031308, 
+        x <= 0.0031308,
         x * 12.92,
         1.055 * libdevice.fast_powf(x, 1/2.4) - 0.055
     )
@@ -33,7 +34,7 @@ def linear_to_srgb_triton(x):
 @triton.jit
 def srgb_to_linear_triton(x):
     return tl.where(
-        x <= 0.04045, 
+        x <= 0.04045,
         x / 12.92,
         libdevice.fast_powf((x + 0.055) / 1.055, 2.4)
     )
@@ -78,47 +79,76 @@ def _get_resize_kernel_triton(k: ResizeKernel):
 
 # Sparse Downscale and support functions.
 
-def create_tile_mask(
-        dest_size: int,
-        src_size: int,
-        kernel_window: float = 4.5,
-        tile_size: int = 64
-    ):
-    k = dest_size / src_size
-    PAD = math.ceil((kernel_window) / k)
-    coords_source = torch.arange(
-        (-PAD + (tile_size / 2)) * k,
-        (src_size + PAD + (tile_size / 2)) * k,
-        tile_size * k,
-        dtype=torch.float32
-    )
-    coords_dest = torch.arange(
-        tile_size / 2,
-        dest_size + (tile_size / 2),
-        tile_size,
-        dtype=torch.float32
-    )
+# Amanatides, John and Woo, Andrew -- Fast Voxel Traversal
+def grid_line_tiles(x0, y0, x1, y1, grid_width, grid_height):
+    tiles = set()
 
-    coord_grid = torch.sub(coords_source.unsqueeze(-1), other=coords_dest)
-    coord_grid.abs_() # inplace operation
-    return torch.lt(coord_grid, tile_size + 0.5)
+    dx = x1 - x0
+    dy = y1 - y0
+
+    x = math.floor(x0)
+    y = math.floor(y0)
+
+    end_x = math.floor(x1)
+    end_y = math.floor(y1)
+
+    step_x = 1 if dx > 0 else -1
+    step_y = 1 if dy > 0 else -1
+
+    t_max_x = ((x + (step_x > 0)) - x0) / dx if dx != 0 else float('inf')
+    t_max_y = ((y + (step_y > 0)) - y0) / dy if dy != 0 else float('inf')
+
+    t_delta_x = abs(1 / dx) if dx != 0 else float('inf')
+    t_delta_y = abs(1 / dy) if dy != 0 else float('inf')
+
+    while True:
+        if 0 <= x < grid_width and 0 <= y < grid_height:
+            tiles.add((y,x))
+        if x == end_x and y == end_y:
+            break
+        if t_max_x < t_max_y:
+            t_max_x += t_delta_x
+            x += step_x
+        else:
+            t_max_y += t_delta_y
+            y += step_y
+
+    return tiles
+
+def tile_mask_function(dest_size, src_size, kernel_window=4.5, tile_size=64):
+    k = dest_size / src_size
+    PAD = math.ceil((kernel_window-0.5) / k)
+
+    grid_size = math.ceil((src_size + 2*PAD)/tile_size), math.ceil(dest_size/tile_size)
+
+    line_1 = 0, 0.5/tile_size, (dest_size)/tile_size, (src_size+0.5)/tile_size
+    line_2 = 0, (2*PAD - 0.5)/tile_size, (dest_size)/tile_size, (src_size + 2*PAD - 0.5)/tile_size
+    lines = line_1, line_2
+
+    mask = torch.zeros(grid_size, dtype=torch.bool)
+
+    tiles = set()
+
+    for (x0, y0, x1, y1) in lines:
+        tiles.update(grid_line_tiles(x0, y0, x1, y1, grid_size[1], grid_size[0]))
+
+    tiles = torch.tensor(list(tiles))
+
+    mask[tiles[:,0], tiles[:,1]] = True
+
+    return mask, tiles
 
 def create_tensor_metadata(
-        num_sparse_blocks: int, 
         tile_mask: torch.Tensor,
+        tiles: torch.Tensor,
         indices: torch.Tensor,
-        # block_offsets_t: torch.Tensor,
-        # col_indices_t: torch.Tensor,
         offsets: torch.Tensor,
         offsets_t: torch.Tensor,
     ):
 
-    # could this run on cuda? yes (on pytorch 2.6). is it worth running on cuda? *no*.
-    torch.nonzero_static(tile_mask, size=num_sparse_blocks, out=indices[:,:2]) # row_indices, col_indices
+    indices[:,:2] = tiles
 
-    # Strangely, being unstable is better for kernel performance.
-    # Stable will cause warp stalls.
-    torch.argsort(indices[:,1], stable=False, out=indices[:,2]) # block_offsets_t
+    torch.argsort(indices[:,1], stable=True, out=indices[:,2]) # block_offsets_t
     torch.take(indices[:,0], indices[:,2], out=indices[:,3]) # col_indices_t
 
     # reusing the offsets buffer here helps performance
@@ -126,6 +156,7 @@ def create_tensor_metadata(
     torch.sum(tile_mask, dim=0, out=offsets_t[1:])
     torch.cumsum(offsets, dim=0, out=offsets)
     torch.cumsum(offsets_t, dim=0, out=offsets_t)
+
     return indices, offsets, offsets_t
 
 # for isolating the one mandatory graph break
@@ -133,18 +164,16 @@ def create_tensor_metadata(
 def _get_nnz_and_buffers(tile_mask):
     num_sparse_blocks = torch.sum(tile_mask).item()
 
-    return (
-        num_sparse_blocks,
-        [
-            # Creating all the index buffers as a single tensor helps greatly with memory transfers.
-            # Since we are transposing it at the start, each index will still be contiguous once sliced.
-            # offsets/offsets_t could be joined too despite their mismatched shapes, but it makes 
-            # torch.compile unhappy and yields no noticeable performance benefit.
-            torch.empty((4, num_sparse_blocks), dtype=torch.int64, pin_memory=True).T, # indices
-            torch.zeros((tile_mask.shape[0] + 1,), dtype=torch.int32, pin_memory=True), # offsets
-            torch.zeros((tile_mask.shape[1] + 1,), dtype=torch.int32, pin_memory=True) # offsets_t
-        ]
-    )
+        # Creating all the index buffers as a single tensor helps greatly with memory transfers.
+        # Since we are transposing it at the start, each index will still be contiguous once sliced.
+        # offsets/offsets_t could be joined too despite their mismatched shapes, but it makes 
+        # torch.compile unhappy and yields no noticeable performance benefit.
+    return [
+        torch.empty((4, num_sparse_blocks), dtype=torch.int64, pin_memory=True).T, # indices
+        torch.zeros((tile_mask.shape[0] + 1,), dtype=torch.int32, pin_memory=True), # offsets
+        torch.zeros((tile_mask.shape[1] + 1,), dtype=torch.int32, pin_memory=True) # offsets_t
+    ]
+
 
 def generate_sparse_matrix(dest_size, src_size, kernel_window=4.5, tile_size=64):
     """
@@ -160,19 +189,19 @@ def generate_sparse_matrix(dest_size, src_size, kernel_window=4.5, tile_size=64)
         Matrix: A sparse representation of the computed coordinate grid.
     """
 
-    tile_mask = create_tile_mask(dest_size, src_size, kernel_window, tile_size)
+    tile_mask, tiles = tile_mask_function(dest_size, src_size, kernel_window, tile_size)
 
     # Needs to be item since used to create tensor shapes. Unavoidable.
     # Inductor also does not support pinned memory, need to create buffers outside of compile.
-    _, buffers = _get_nnz_and_buffers(tile_mask)
-    num_sparse_blocks = buffers[0].shape[0] # should be better for torch.compile
+    buffers = _get_nnz_and_buffers(tile_mask)
+    num_sparse_blocks = buffers[0].shape[0]
 
     # Pinned memory buffers created here will be the in the same memory locations ultimately used.
     # The transpose on the indices matrix is done so that row_indices and col_indices are contiguous
     # when assigned from the results of nonzero, which makes the following copy to GPU faster.
     indices, offsets, offsets_t = create_tensor_metadata(
-        num_sparse_blocks,
         tile_mask,
+        tiles,
         *buffers
     )
 
@@ -184,9 +213,9 @@ def generate_sparse_matrix(dest_size, src_size, kernel_window=4.5, tile_size=64)
         torch.empty(num_sparse_blocks, tile_size, tile_size, dtype=torch.float16, device='cuda'),
         row_indices=indices[:,0],
         column_indices=indices[:,1],
-        offsets=offsets.to(device='cuda', dtype=torch.int32, non_blocking=True),
+        offsets=offsets.to(device='cuda', non_blocking=True),
         column_indices_t=indices[:,3],
-        offsets_t=offsets_t.to(device='cuda', dtype=torch.int32, non_blocking=True),
+        offsets_t=offsets_t.to(device='cuda', non_blocking=True),
         block_offsets_t=indices[:,2]
     )
 
@@ -213,12 +242,9 @@ def compute_sparse_coord_grid_kernel(
 
     x = tl.cast(coord_source[:, None] - coord_dest[None, :], tl.float16)
 
-    # Magic Kernel Sharp modified to operate in-place on negative values
-    # For some reason doing it this way is slightly faster, but less readable.
     x = magic_kernel_sharp_2021_triton(x)
 
-    # Strangely, this is far more accurate in Triton than it is in Torch.
-    x /= (1/k)
+    x *= k
 
     sparse_block_ptr = sparse_data_ptr + sparse_block * SPARSE_BLOCK_NUMEL
 
@@ -276,7 +302,7 @@ def compute_coord_grid_kernel(
 
     x = magic_kernel_sharp_2021_triton(x)
 
-    x /= (1/k)
+    x *= k
 
     tl.store(coord_grid_ptr + row_offsets[:, None] * N + col_offsets[None, :], x, mask=mask_row[:, None] & mask_col[None, :])
 

@@ -39,7 +39,7 @@ def srgb_to_linear_triton(x):
         libdevice.fast_powf((x + 0.055) / 1.055, 2.4)
     )
 
-from sharpfin.sparse_backend import triton_dds, Matrix
+from sharpfin.sparse_backend import triton_dds, triton_dds_sbsc, Matrix, SBSCMatrix
 
 def _get_resize_kernel_triton(k: ResizeKernel):
     match k:
@@ -221,10 +221,10 @@ def generate_sparse_matrix(dest_size, src_size, kernel_window=4.5, tile_size=64)
 
 @triton.jit
 def compute_sparse_coord_grid_kernel(
-    coords_source_ptr, coords_dest_ptr, sparse_data_ptr,
-    row_indices_ptr, col_indices_ptr,
-    k: float, M: int, N: int, BLOCK_SIZE: tl.constexpr, SPARSE_BLOCK_SIZE: tl.constexpr
-):
+        coords_source_ptr, coords_dest_ptr, sparse_data_ptr,
+        row_indices_ptr, col_indices_ptr,
+        k: float, M: int, N: int, BLOCK_SIZE: tl.constexpr, SPARSE_BLOCK_SIZE: tl.constexpr
+    ):
     SPARSE_BLOCK_NUMEL = SPARSE_BLOCK_SIZE * SPARSE_BLOCK_SIZE
     sparse_block = tl.program_id(0)
 
@@ -286,9 +286,9 @@ def compute_sparse_coord_grid(target_size, source_size, kernel_window, BLOCK_SIZ
 
 @triton.jit
 def compute_coord_grid_kernel(
-    coords_source_ptr, coords_dest_ptr, coord_grid_ptr, k,
-    M, N, BLOCK_SIZE: tl.constexpr, 
-):
+        coords_source_ptr, coords_dest_ptr, coord_grid_ptr, k,
+        M, N, BLOCK_SIZE: tl.constexpr, 
+    ):
     row_offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     col_offsets = tl.program_id(1) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     
@@ -321,16 +321,16 @@ def compute_coord_grid(target_size, source_size, kernel_window=4.5, BLOCK_SIZE=3
     return coord_grid
 
 @triton.jit
-def srgb_to_linear_pad_replicate_kernel(
-    x_ptr, y_ptr,
-    M_X, N_X,
-    M_Y, N_Y,
-    M_PAD, N_PAD,
-    stride_xc, stride_xm, stride_xn,
-    stride_yc, stride_ym, stride_yn,
-    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
-):
-    
+def pad_replicate_kernel(
+        A, B,
+        M_X, N_X,
+        M_Y, N_Y,
+        M_PAD, N_PAD,
+        stride_xc, stride_xm, stride_xn,
+        stride_yc, stride_ym, stride_yn,
+        BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+        fuse_linrgb: tl.constexpr
+    ):
     pid_c = tl.program_id(0)
     pid_m = tl.program_id(1)
     pid_n = tl.program_id(2)
@@ -345,19 +345,21 @@ def srgb_to_linear_pad_replicate_kernel(
     mask_m = offs_m < M_Y
     mask_n = offs_n < N_Y
 
-    x_block_ptrs = x_ptr + pid_c * stride_xc + offs_m_cl[:, None] * stride_xm + offs_n_cl[None, :] * stride_xn
-    y_block_ptrs = y_ptr + pid_c * stride_yc + offs_m[:, None] * stride_ym + offs_n[None, :] * stride_yn
+    A_ptr = A + pid_c * stride_xc + offs_m_cl[:, None] * stride_xm + offs_n_cl[None, :] * stride_xn
+    B_ptr = B + pid_c * stride_yc + offs_m[:, None] * stride_ym + offs_n[None, :] * stride_yn
 
-    x_vals = tl.load(x_block_ptrs)
-    y_vals = srgb_to_linear_triton(x_vals)
+    t = tl.load(A_ptr)
+    if fuse_linrgb:
+        t = srgb_to_linear_triton(t)
 
-    tl.store(y_block_ptrs, y_vals, mask=mask_m[:, None] & mask_n[None, :])
+    tl.store(B_ptr, t, mask=mask_m[:, None] & mask_n[None, :])
 
-def srgb_to_linear_pad_replicate(
+def pad_replicate(
         img: torch.Tensor,
         pad_h: int,
         pad_w: int,
         sparse_block_size: int = 0,
+        fuse_linrgb: bool = True,
     ):
     C = img.shape[0]
 
@@ -382,7 +384,7 @@ def srgb_to_linear_pad_replicate(
         (out.shape[2] + META['BLOCK_N'] - 1) // META['BLOCK_N'],
     )
 
-    srgb_to_linear_pad_replicate_kernel[grid](
+    pad_replicate_kernel[grid](
         img, out,
         img.shape[1], img.shape[2],
         out.shape[1], out.shape[2],
@@ -390,6 +392,7 @@ def srgb_to_linear_pad_replicate(
         img.stride(0), img.stride(1), img.stride(2),
         out.stride(0), out.stride(1), out.stride(2),
         BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
+        fuse_linrgb=fuse_linrgb,
     )
     return out
 
@@ -397,9 +400,9 @@ def downscale_sparse(
         image: torch.Tensor,
         target_size: Tuple[int, int],
         resize_kernel: ResizeKernel = ResizeKernel.MAGIC_KERNEL_SHARP_2021,
+        do_gamma_handling=True,
         BLOCK_SIZE: int = 32,
         SPARSE_BLOCK_SIZE: int = 64,
-
     ) -> torch.Tensor:
     kernel, window = _get_resize_kernel_triton(resize_kernel)
 
@@ -414,11 +417,28 @@ def downscale_sparse(
     PAD_W = math.ceil((window - 0.5) / (T_W / S_W))
     PAD_H = math.ceil((window - 0.5) / (T_H / S_H))
 
-    image = srgb_to_linear_pad_replicate(image, PAD_H, PAD_W, SPARSE_BLOCK_SIZE)
+    image = pad_replicate(
+        image,
+        PAD_H,
+        PAD_W,
+        SPARSE_BLOCK_SIZE,
+        fuse_linrgb=do_gamma_handling
+    )
 
-    image = triton_dds(image, y_s_w, output_mt=True)
+    image = triton_dds(
+        image,
+        y_s_w,
+        output_mt=True
+    )
 
-    image = triton_dds(image, y_s_h, fuse_srgb=True, output_mt=True, output_slice=(T_H, T_W))
+    image = triton_dds(
+        image,
+        y_s_h,
+        fuse_srgb=do_gamma_handling,
+        clamp_output=True,
+        output_mt=True,
+        output_slice=(T_H, T_W)
+    )
 
     return image
 
@@ -426,6 +446,7 @@ def downscale_triton(
         image: torch.Tensor,
         target_size: torch.Size,
         resize_kernel: ResizeKernel = ResizeKernel.MAGIC_KERNEL_SHARP_2021,
+        do_gamma_handling=True,
     ) -> torch.Tensor:
     kernel, window = _get_resize_kernel_triton(resize_kernel)
 
@@ -435,7 +456,7 @@ def downscale_triton(
     PAD_W = math.ceil((window - 0.5) / (target_size[-1] / image.shape[-1]))
     PAD_H = math.ceil((window - 0.5) / (target_size[-2] / image.shape[-2]))
 
-    image = srgb_to_linear_pad_replicate(image, PAD_H, PAD_W)
+    image = pad_replicate(image, PAD_H, PAD_W, fuse_linrgb=do_gamma_handling)
 
     image = image.view(-1, image.shape[-1])
     image = image @ y_s_w
@@ -445,6 +466,234 @@ def downscale_triton(
     image = image @ y_s_h
     image = image.view(3, -1, image.shape[-1])
     image = image.mT
-    image = linear_to_srgb(image[:, :target_size[0], :target_size[1]])
+    if do_gamma_handling:
+        image = linear_to_srgb(image[:, :target_size[0], :target_size[1]])
     image.clamp_(0.,1.)
+    return image
+
+# Single Block Sparse Column implementations.
+
+import math
+
+
+def evaluate_line(x, x0, y0, x1, y1):
+    """Evaluate the y-coordinate at a given x along a line from (x0, y0) to (x1, y1)."""
+    if x1 == x0:
+        return float('inf')
+    t = (x - x0) / (x1 - x0)
+    return y0 + t * (y1 - y0)
+
+def pad_height_to_multiple(height, multiple):
+    """Pad a height up to the next multiple of 'multiple'."""
+    return int(math.ceil(height / multiple) * multiple)
+
+def generate_sbsc_structure(
+        dest_size,
+        src_size,
+        kernel_window=4.5,
+        tile_size=64,
+        y_tile_size=32
+    ):
+    """
+    Returns:
+      fixed_offset: single integer step between each block's starting y
+      max_height  : the padded block height
+      n_blocks    : number of tiles horizontally
+      tile_size   : as passed in
+    """
+    # 1) Precompute the two mapping lines
+    k = dest_size / src_size
+    PAD = math.ceil((kernel_window - 0.5) / k)
+
+    # line₁ maps to the top edge; line₂ to the bottom edge
+    line1 = (0, 0.5, dest_size, src_size + 0.5)
+    line2 = (0, 2 * PAD - 0.5, dest_size, src_size + 2 * PAD - 0.5)
+
+    # 2) First pass: gather y_min, y_max for each block, track max_height
+    y_mins = []
+    y_maxs = []
+    n_blocks = math.ceil(dest_size / tile_size)
+    max_height = 0
+
+    for i in range(n_blocks):
+        x0 = i * tile_size
+        x1 = min(dest_size - 1, x0 + tile_size - 1)
+
+        yt0 = evaluate_line(x0, *line1)
+        yt1 = evaluate_line(x1, *line1)
+        yb0 = evaluate_line(x0, *line2)
+        yb1 = evaluate_line(x1, *line2)
+
+        y_min = min(yt0, yt1)
+        y_max = max(yb0, yb1)
+
+        height = y_max - y_min
+        padded = pad_height_to_multiple(height, y_tile_size)
+
+        y_mins.append(y_min)
+        y_maxs.append(y_max)
+        max_height = max(max_height, padded)
+
+    # 3) Ideal continuous offset per tile
+    slope_top = (line1[3] - line1[1]) / (line1[2] - line1[0])
+    ideal_step = slope_top * tile_size
+
+    # 4) Build coverage constraints:
+    #    for i>0, (y_maxs[i] - max_height)/i <= offset <= y_mins[i]/i
+    lower_bounds = []
+    upper_bounds = []
+    for i in range(1, n_blocks):
+        lower_bounds.append((y_maxs[i] - max_height) / i)
+        upper_bounds.append(y_mins[i] / i)
+
+    # integer bounds
+    lower = math.ceil(max(lower_bounds)) if lower_bounds else 0
+    upper = math.floor(min(upper_bounds)) if upper_bounds else int(round(ideal_step))
+
+    # 5) Clamp the rounded ideal step
+    fixed_offset = int(round(ideal_step))
+    if fixed_offset < lower:
+        fixed_offset = lower
+    elif fixed_offset > upper:
+        fixed_offset = upper
+
+    return fixed_offset, max_height, n_blocks, tile_size
+
+
+def generate_sbsc_matrix(dest_size, src_size, kernel_window=4.5, tile_size=64, y_tile_size=32):
+    """
+    Generate a sparse resampling matrix based on a block-wise mask.
+    
+    Parameters:
+        dest_size (int): Number of output pixels.
+        src_size (int): Number of input pixels.
+        kernel_window (float): Effective width of the resampling kernel.
+        tile_size (int): Size of each sparse block.
+
+    Returns:
+        SBSCMatrix: A sparse representation of the computed coordinate grid.
+    """
+
+    offset, block_height, num_blocks, col_width = generate_sbsc_structure(
+        dest_size, src_size, kernel_window, tile_size, y_tile_size
+    )
+
+    return SBSCMatrix(
+        size=((offset * (num_blocks - 1)) + block_height, dest_size),
+        data=torch.empty((num_blocks, block_height, col_width), dtype=torch.float16, device='cuda'),
+        offset=offset,
+        block_size=y_tile_size
+    )
+
+@triton.jit
+def compute_sbsc_coord_grid_kernel(
+        coords_source_ptr, coords_dest_ptr,
+        sparse_data_ptr, offset: tl.constexpr,
+        stride_xb, stride_xw, stride_xh,
+        k: float, M: int, N: int, BLOCK_SIZE: tl.constexpr, SPARSE_BLOCK_SIZE: tl.constexpr
+    ):
+
+    pid_w = tl.program_id(0)
+    pid_h = tl.program_id(1)
+
+    start_row = offset * pid_w + pid_h * BLOCK_SIZE
+    start_col = pid_w * SPARSE_BLOCK_SIZE
+
+    row_offsets = start_row + tl.arange(0, BLOCK_SIZE)
+    col_offsets = start_col + tl.arange(0, SPARSE_BLOCK_SIZE)
+
+    mask_row = row_offsets < M
+    mask_col = col_offsets < N
+
+    coord_source = tl.load(coords_source_ptr + row_offsets, mask=mask_row, other=0.0)
+    coord_dest = tl.load(coords_dest_ptr + col_offsets, mask=mask_col, other=0.0)
+
+    y = tl.cast(coord_source[:, None] - coord_dest[None, :], tl.float16)
+
+    y = magic_kernel_sharp_2021_triton(y)
+
+    y *= k
+
+    sparse_block_ptr = sparse_data_ptr + pid_w * stride_xb
+
+    local_row_start = pid_h * BLOCK_SIZE
+
+    local_rows = local_row_start + tl.arange(0, BLOCK_SIZE)
+    local_cols = tl.arange(0, SPARSE_BLOCK_SIZE)
+
+    local_rows_2d = local_rows[:, None]
+    local_cols_2d = local_cols[None, :]
+
+    store_offset = local_rows_2d * SPARSE_BLOCK_SIZE + local_cols_2d
+
+    tl.store(sparse_block_ptr + store_offset, y)
+
+def compute_sbsc_coord_grid(target_size, source_size, kernel_window, BLOCK_SIZE=32, SPARSE_BLOCK_SIZE=64):
+    # assert SPARSE_BLOCK_SIZE % BLOCK_SIZE == 0
+
+    k = target_size / source_size
+    PAD = math.ceil((kernel_window - 0.5) / k)
+
+    coords_source = torch.arange((-PAD + 0.5)*k, (source_size + PAD + 0.5)*k, k, dtype=torch.float32, device='cuda')
+    coords_dest = torch.arange(0.5, target_size + 0.5, 1, dtype=torch.float32, device='cuda')
+
+    M, N = coords_source.shape[0], coords_dest.shape[0]
+    x = generate_sbsc_matrix(target_size, source_size, kernel_window, SPARSE_BLOCK_SIZE, BLOCK_SIZE)
+
+    SPARSE_BLOCKS, BLOCK_HEIGHT, _ = x.data.shape # other is SPARSE_BLOCK_SIZE
+    stride_xb, stride_xh, stride_xw = x.data.stride()
+
+    grid = lambda meta: (SPARSE_BLOCKS, triton.cdiv(BLOCK_HEIGHT, meta['BLOCK_SIZE']))
+    compute_sbsc_coord_grid_kernel[grid](
+        coords_source, coords_dest,
+        x.data, x.offset,
+        stride_xb, stride_xh, stride_xw,
+        k, M, N, BLOCK_SIZE, SPARSE_BLOCK_SIZE)
+    return x
+
+
+def downscale_sbsc(
+        image: torch.Tensor,
+        target_size: Tuple[int, int],
+        resize_kernel: ResizeKernel = ResizeKernel.MAGIC_KERNEL_SHARP_2021,
+        do_gamma_handling=True,
+        BLOCK_SIZE: int = 32,
+        SPARSE_BLOCK_SIZE: int = 64,
+    ) -> torch.Tensor:
+    kernel, window = _get_resize_kernel_triton(resize_kernel)
+
+    T_W = target_size[-1]
+    T_H = target_size[-2]
+    S_W = image.shape[-1]
+    S_H = image.shape[-2]
+
+    y_s_w = compute_sbsc_coord_grid(T_W, S_W, window, BLOCK_SIZE, SPARSE_BLOCK_SIZE)
+    y_s_h = compute_sbsc_coord_grid(T_H, S_H, window, BLOCK_SIZE, SPARSE_BLOCK_SIZE)
+
+    PAD_W = math.ceil((window - 0.5) / (T_W / S_W))
+    PAD_H = math.ceil((window - 0.5) / (T_H / S_H))
+
+    image = pad_replicate(
+        image,
+        PAD_H,
+        PAD_W,
+        fuse_linrgb=do_gamma_handling,
+        sparse_block_size=SPARSE_BLOCK_SIZE,
+    )
+
+    image = triton_dds_sbsc(
+        image,
+        y_s_w,
+        output_mt=True
+    )
+
+    image = triton_dds_sbsc(
+        image,
+        y_s_h,
+        fuse_srgb=do_gamma_handling,
+        clamp_output=True,
+        output_mt=True,
+        # output_slice=(T_H, T_W)
+    )
+
     return image

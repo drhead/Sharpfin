@@ -4,7 +4,7 @@ import triton
 import triton.language as tl
 from typing import Tuple
 from dataclasses import dataclass
-from .triton_functional import linear_to_srgb_triton
+from .triton_functional import linear_to_srgb_triton, srgb_to_linear_triton, magic_kernel_sharp_2021_triton, lanczos_triton
 
 # Code is all adapted from https://github.com/stanford-futuredata/stk, licensed under Apache-2.0
 # Very reduced set of functions for handling DDS (Dense = Dense @ Sparse) matmul only, with the
@@ -582,10 +582,9 @@ def triton_dds(
 
 @triton.autotune(
     configs=[
-        # basic configs for compute-bound matmuls
-        triton.Config({}, num_stages=TritonConfig.NUM_STAGES, num_warps=TritonConfig.NUM_WARPS),
+        triton.Config({}, num_stages=4, num_warps=2),
     ],
-    key=['M', 'N', 'K'],
+    key=['BLOCK_SIZE', 'BLOCK_N'],
 )
 @triton.jit
 def _dds_sbsc_kernel(
@@ -599,14 +598,11 @@ def _dds_sbsc_kernel(
         BLOCK_SIZE: tl.constexpr, GROUP_M: tl.constexpr, ACC_TYPE: tl.constexpr,
     ):
 
-    pid_c = tl.program_id(0) # channel axis
+    pid_n = tl.program_id(0) # block N axis
     pid_m = tl.program_id(1) # block M axis
-    pid_n = tl.program_id(2) # block N axis
+    pid_c = tl.program_id(2) # channel axis
 
-    num_pid_m = tl.num_programs(1)
-    num_pid_n = tl.num_programs(2)
-
-    pid_n, pid_m = tl.swizzle2d(pid_n, pid_m, num_pid_n, num_pid_m, GROUP_M)
+    nsub_blocks = tl.cdiv(BLOCK_SIZE, BLOCK_K)
 
     start_row = block_offset * pid_n
 
@@ -615,7 +611,7 @@ def _dds_sbsc_kernel(
         strides=(stride_am, stride_ak),
         offsets=(pid_m * BLOCK_M, start_row),
         block_shape=(BLOCK_M, BLOCK_K),
-        order=(1, 0)
+        order=(0, 1)
     )
 
     B_block_ptr = tl.make_block_ptr(
@@ -626,14 +622,14 @@ def _dds_sbsc_kernel(
         order=(0, 1)
     )
 
-    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float16)
-    nsub_blocks = tl.cdiv(BLOCK_SIZE, BLOCK_K)
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
 
     for block_slice in range(nsub_blocks):
-        a = tl.load(A_block_ptr) #, boundary_check=(0,), padding_option='zero')
-        b = tl.load(B_block_ptr)
+        a = tl.load(A_block_ptr, eviction_policy='evict_first', boundary_check=(0,), padding_option='zero')
+        b = tl.load(B_block_ptr, eviction_policy='evict_last')
 
-        acc = tl.dot(a, b, acc, out_dtype=tl.float16)
+        acc = tl.dot(a, b, acc, out_dtype=tl.float32)
 
         A_block_ptr = A_block_ptr.advance((0, BLOCK_K))
         B_block_ptr = B_block_ptr.advance((BLOCK_K, 0))
@@ -644,8 +640,8 @@ def _dds_sbsc_kernel(
     if clamp_output:
         acc = tl.clamp(acc, 0.0, 1.0)
 
-    if fuse_srgb or clamp_output:
-        acc = acc.to(C.dtype.element_ty)
+    # if fuse_srgb or clamp_output:
+    acc = acc.to(C.dtype.element_ty)
 
     C_block_ptr = tl.make_block_ptr(
         base=C + pid_c * stride_cc, shape=(O_M, O_N),
@@ -655,7 +651,7 @@ def _dds_sbsc_kernel(
         order=(1, 0)
     )
 
-    tl.store(C_block_ptr, acc, boundary_check=(0, 1))
+    tl.store(C_block_ptr, acc, boundary_check=(0, 1), cache_modifier='.cs')
 
 def triton_dds_sbsc(
         lhs: torch.Tensor,
@@ -711,8 +707,7 @@ def triton_dds_sbsc(
         stride_cm, stride_cn = out.stride(-2), out.stride(-1)
         stride_cc = out.stride(-3)
 
-    # checks constraints
-    assert lhs.shape[-1] <= rhs.size[0], "incompatible dimensions" # changed to LTE to allow padded RHS
+    assert lhs.shape[-1] <= rhs.size[0], f"incompatible dimensions: {lhs.shape[-1]} > {rhs.size[0]}" # changed to LTE to allow padded RHS
 
     stride_am, stride_ak = lhs.stride(-2), lhs.stride(-1)
 
@@ -720,7 +715,7 @@ def triton_dds_sbsc(
 
     # launch kernel
     # grid is channels, image slices, sparse columns
-    grid = lambda META: (CH, triton.cdiv(M, META['BLOCK_M']), triton.cdiv(N, META['BLOCK_N']))
+    grid = lambda META: (triton.cdiv(N, META['BLOCK_N']), triton.cdiv(M, META['BLOCK_M']), CH)
 
     _dds_sbsc_kernel[grid](
         lhs, rhs.data, out, M, N, K, O_M, O_N,
@@ -728,7 +723,177 @@ def triton_dds_sbsc(
         stride_bb, stride_bk, stride_bn,
         stride_cc, stride_cm, stride_cn,
         rhs.offset, fuse_srgb, clamp_output,
-        GROUP_M=32, ACC_TYPE=tl.float16, BLOCK_M=64,
+        GROUP_M=32, ACC_TYPE=tl.float16, BLOCK_M=32,
         BLOCK_N=rhs.data.shape[2], BLOCK_SIZE=rhs.data.shape[1], BLOCK_K=rhs.col_block_size
+    )
+    return out
+
+from triton.language.extra import libdevice
+
+@triton.autotune(
+    configs=[
+        # triton.Config({}, num_stages=4, num_warps=2),
+        triton.Config({}, num_stages=4, num_warps=2),
+        # triton.Config({}, num_stages=4, num_warps=8),
+    ],
+    key=['BLOCK_SIZE', 'BLOCK_N'],
+)
+@triton.jit
+def _dds_sbsc_zerorhs_kernel(
+        A: tl.tensor, C: tl.tensor, M, N, K, O_M, O_N,
+        stride_ac, stride_am, stride_ak,
+        stride_cc, stride_cm, stride_cn,
+        k, PAD, block_offset: tl.constexpr,
+        fuse_srgb: tl.constexpr, gamma_correction: tl.constexpr, clamp_output: tl.constexpr,
+        BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+        BLOCK_SIZE: tl.constexpr,
+    ):
+
+    pid_n = tl.program_id(0) # block N axis
+    pid_m = tl.program_id(1) # block M axis
+    pid_c = tl.program_id(2) # channel axis
+
+    nsub_blocks = triton.cdiv(BLOCK_SIZE, BLOCK_K)
+    # tl.static_print(f"nsub_blocks: {triton.cdiv(BLOCK_SIZE, BLOCK_K)}")
+
+    start_row = block_offset * pid_n
+
+    offs_k = (start_row + tl.arange(0, BLOCK_K)) * stride_ak
+    m_range = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    A_mask = (m_range < M)[None, :].broadcast_to(BLOCK_K, BLOCK_M)
+
+    A_M_ptr = A + pid_c * stride_ac + stride_am * m_range
+
+    b_k = ((start_row - PAD + tl.arange(0, BLOCK_K)).to(tl.float32) + 0.5) * k
+    b_n = (pid_n * BLOCK_N + tl.arange(0, BLOCK_N)).to(tl.float32) + 0.5
+
+    b_base = (b_k[None, :] - b_n[:, None])
+
+    acc = tl.zeros((BLOCK_N, BLOCK_M), dtype=tl.float16)
+
+    for _ in tl.range(nsub_blocks):
+        A_ptr = A_M_ptr[None, :] + tl.minimum(tl.maximum(offs_k, PAD) - PAD, K - 1)[:, None]
+
+        a = tl.load(A_ptr, mask=A_mask)
+
+        b = magic_kernel_sharp_2021_triton(b_base) * k
+
+        b = b.to(tl.float16)
+
+        if fuse_srgb == 'input':
+            if gamma_correction == 'fast':
+                a = libdevice.fast_powf(a, 2.2).to(tl.float16)
+            elif gamma_correction == 'srgb':
+                a = srgb_to_linear_triton(a).to(tl.float16)
+
+        acc = tl.dot(b, a, acc, out_dtype=tl.float16)
+
+        offs_k += BLOCK_K * stride_ak
+        b_base += BLOCK_K * k
+
+    if fuse_srgb == 'output':
+        if gamma_correction == 'fast':
+            acc = libdevice.fast_powf(acc, 1.0/2.2)
+        elif gamma_correction == 'srgb':
+            acc = linear_to_srgb_triton(acc)
+
+    if clamp_output:
+        acc = tl.clamp(acc, 0.0, 1.0)
+
+    if fuse_srgb == 'output' or clamp_output:
+        acc = acc.to(C.dtype.element_ty)
+
+    C_block_ptr = tl.make_block_ptr(
+        base=C + pid_c * stride_cc, shape=(O_N, O_M),
+        strides=(stride_cn, stride_cm),
+        offsets=(pid_n * BLOCK_N, pid_m * BLOCK_M),
+        block_shape=(BLOCK_N, BLOCK_M),
+        order=(1, 0)
+    )
+
+    tl.store(C_block_ptr, acc, boundary_check=(0, 1), cache_modifier='.cs')
+
+import math
+
+
+def triton_dds_zerorhs_sbsc(
+        lhs: torch.Tensor,
+        target_size: int,
+        source_size: int,
+        kernel_window: float,
+        block_specs,
+        fuse_srgb: str = '',
+        gamma_correction: str = 'fast',
+        clamp_output: bool = False,
+        output_mt: bool = False,
+        output_slice: None | Tuple[int,int] = None
+    ):
+    assert isinstance(lhs, torch.Tensor)
+
+    assert fuse_srgb in ['input', 'output', '']
+    assert gamma_correction in ['fast', 'srgb']
+
+    k = target_size / source_size
+
+    PAD = math.ceil((kernel_window - 0.5) / k)
+
+    offset, block_height, num_blocks, col_width = block_specs
+
+    assert lhs.ndim == 3
+    CH = lhs.shape[0]
+    stride_ac = lhs.stride(0)
+
+    M, K = lhs.shape[-2:]
+    N = target_size
+
+    if output_mt:
+        # output = N, M
+        if output_slice is not None:
+            O_N, O_M = output_slice
+            out = torch.empty(
+                (*lhs.shape[:-2], *output_slice),
+                dtype=lhs.dtype,
+                device=lhs.device
+            )
+        else:
+            O_N, O_M = N, M
+            out = torch.empty(
+                (*lhs.shape[:-2], N, M),
+                dtype=lhs.dtype,
+                device=lhs.device
+            )
+        stride_cm, stride_cn = out.stride(-1), out.stride(-2)
+        stride_cc = out.stride(-3)
+    else:
+        # output = M, N
+        if output_slice is not None:
+            O_M, O_N = output_slice
+            out = torch.empty(
+                (*lhs.shape[:-2], *output_slice),
+                dtype=lhs.dtype,
+                device=lhs.device
+            )
+        else:
+            O_M, O_N = M, N
+            out = torch.empty(
+                (*lhs.shape[:-2], M, N),
+                dtype=lhs.dtype,
+                device=lhs.device
+            )
+        stride_cm, stride_cn = out.stride(-2), out.stride(-1)
+        stride_cc = out.stride(-3)
+
+    stride_am, stride_ak = lhs.stride(-2), lhs.stride(-1)
+
+    # launch kernel
+    # grid is channels, image slices, sparse columns
+    grid = lambda META: (triton.cdiv(N, META['BLOCK_N']), triton.cdiv(M, META['BLOCK_M']), CH)
+
+    _dds_sbsc_zerorhs_kernel[grid](
+        lhs, out, M, N, K, O_M, O_N,
+        stride_ac, stride_am, stride_ak,
+        stride_cc, stride_cm, stride_cn,
+        k, PAD, offset, fuse_srgb, gamma_correction, clamp_output,
+        BLOCK_M=32, BLOCK_K=16, BLOCK_N=col_width, BLOCK_SIZE=block_height,
     )
     return out

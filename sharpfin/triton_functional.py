@@ -9,26 +9,49 @@ import torch.nn.functional as F
 from triton.language.extra import libdevice
 from sharpfin.util import linear_to_srgb, srgb_to_linear
 
-# Magic Kernel Sharp modified to operate in-place on negative values
-# For some reason doing it this way is slightly faster, but less readable.
+# Magic Kernel Sharp with Triton optimizations. Mainly converted to polynomials so that
+# FMA operators can be used.
 @triton.jit
-def magic_kernel_sharp_2021_triton(x: tl.tensor) -> tl.tensor:
-    x = libdevice.copysign(x, -1.) # equivalent to -tl.abs(x), less ops
-    x = tl.where(x >= -0.5, (577/576) - (239/144) * (x * x), x)
-    x = tl.where(x < -0.5 and x >= -1.5, (35/36) * (x + 1) * (x + 239/140), x)
-    x = tl.where(x < -1.5 and x >= -2.5, -(1/6) * (x + 2) * (65/24 + x), x)
-    x = tl.where(x < -2.5 and x >= -3.5, (1/36) * (x + 3) * (x + 15/4), x)
-    x = tl.where(x < -3.5 and x >= -4.5, -(1/288) * ((x + 9/2) * (x + 9/2)), x)
-    x = tl.where(x < -4.5, 0, x)
-    return x
+def magic_kernel_sharp_2021_triton(x: tl.tensor):
+    out = tl.zeros_like(x) # inplace operation doesn't help much.
+    x = tl.abs(x)
 
-# NOTE: libdevice.fast_powf mostly just clips subnormals compared to libdevice.pow
+    lte_05 = x <= 0.5
+    lte_15 = x <= 1.5
+    lte_25 = x <= 2.5
+    lte_35 = x <= 3.5
+    lte_45 = x <= 4.5
+
+    x_sq = x*x # triton would compile like this anyways but it helps readability
+
+    out = tl.where(lte_05,                tl.fma(x_sq, -239/144, 577/576), out)
+    out = tl.where(lte_15 and not lte_05, tl.fma(x_sq, 35/36,    tl.fma(x, -379/144, 239/144)), out)
+    out = tl.where(lte_25 and not lte_15, tl.fma(x_sq, -1/6,     tl.fma(x, 113/144, -65/72)), out)
+    out = tl.where(lte_35 and not lte_25, tl.fma(x_sq, 1/36,     tl.fma(x, -3/16, 5/16)), out)
+    out = tl.where(lte_45 and not lte_35, tl.fma(x_sq, -1/288,   tl.fma(x, 1/32, -9/128)), out)
+
+    return out
+
+@triton.jit
+def sinc_triton(x: tl.tensor):
+    y = tl.fma(x, math.pi, 1e-8)
+    return libdevice.fast_sinf(y) / y
+
+@triton.jit
+def lanczos_triton(x: tl.tensor, n: tl.constexpr = 3):
+    return tl.where(
+        tl.abs(x) < n,
+        sinc_triton(x) * sinc_triton(x/n),
+        0
+    )
+
+# NOTE: there is no reason to use libdevice.pow, its only differences are with subnormals
 @triton.jit
 def linear_to_srgb_triton(x):
     return tl.where(
         x <= 0.0031308,
         x * 12.92,
-        1.055 * libdevice.fast_powf(x, 1/2.4) - 0.055
+        tl.fma(1.055, libdevice.fast_powf(x, 1/2.4), -0.055)
     )
 
 @triton.jit
@@ -36,10 +59,10 @@ def srgb_to_linear_triton(x):
     return tl.where(
         x <= 0.04045,
         x / 12.92,
-        libdevice.fast_powf((x + 0.055) / 1.055, 2.4)
+        libdevice.fast_powf(tl.fma(1/1.055, x, 0.055/1.055), 2.4)
     )
 
-from sharpfin.sparse_backend import triton_dds, triton_dds_sbsc, Matrix, SBSCMatrix
+from sharpfin.sparse_backend import triton_dds, triton_dds_sbsc, triton_dds_zerorhs_sbsc, Matrix, SBSCMatrix
 
 def _get_resize_kernel_triton(k: ResizeKernel):
     match k:
@@ -62,7 +85,7 @@ def _get_resize_kernel_triton(k: ResizeKernel):
             raise NotImplementedError
             kernel_window = 2.
         case ResizeKernel.LANCZOS3:
-            raise NotImplementedError
+            resize_kernel = lanczos_triton
             kernel_window = 3.
         case ResizeKernel.MAGIC_KERNEL:
             raise NotImplementedError
@@ -656,7 +679,7 @@ def downscale_sbsc(
         image: torch.Tensor,
         target_size: Tuple[int, int],
         resize_kernel: ResizeKernel = ResizeKernel.MAGIC_KERNEL_SHARP_2021,
-        do_gamma_handling=True,
+        do_gamma_handling: bool = True,
         BLOCK_SIZE: int = 32,
         SPARSE_BLOCK_SIZE: int = 64,
     ) -> torch.Tensor:
@@ -691,6 +714,51 @@ def downscale_sbsc(
         image,
         y_s_h,
         fuse_srgb=do_gamma_handling,
+        clamp_output=True,
+        output_mt=True,
+        # output_slice=(T_H, T_W)
+    )
+
+    return image
+
+
+def downscale_sbsc_zerorhs(
+        image: torch.Tensor,
+        target_size: Tuple[int, int],
+        resize_kernel: ResizeKernel = ResizeKernel.MAGIC_KERNEL_SHARP_2021,
+        do_gamma_handling=True,
+        gamma_handling_type: str = 'fast',
+        BLOCK_SIZE: int = 32,
+        SPARSE_BLOCK_SIZE: int = 64,
+    ) -> torch.Tensor:
+    kernel, window = _get_resize_kernel_triton(resize_kernel)
+
+    T_W = target_size[-1]
+    T_H = target_size[-2]
+    S_W = image.shape[-1]
+    S_H = image.shape[-2]
+
+    block_specs_w = generate_sbsc_structure(
+        T_W, S_W, window, BLOCK_SIZE, SPARSE_BLOCK_SIZE
+    )
+
+    block_specs_h = generate_sbsc_structure(
+        T_H, S_H, window, BLOCK_SIZE, SPARSE_BLOCK_SIZE
+    )
+
+    image = triton_dds_zerorhs_sbsc(
+        image,
+        T_W, S_W, window, block_specs_w,
+        fuse_srgb='input' if do_gamma_handling else '',
+        gamma_correction=gamma_handling_type,
+        output_mt=True
+    )
+
+    image = triton_dds_zerorhs_sbsc(
+        image,
+        T_H, S_H, window, block_specs_h,
+        fuse_srgb='output' if do_gamma_handling else '',
+        gamma_correction=gamma_handling_type,
         clamp_output=True,
         output_mt=True,
         # output_slice=(T_H, T_W)
